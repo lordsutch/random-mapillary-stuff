@@ -751,7 +751,10 @@ for input_ts_file in inputfiles:
                 meters = meters + args.metric_distance
                 i = 1
                 if args.turning_angle:
-                    while i in locdata and not (meters >= locdata[i-1]["metric"] and meters<=locdata[i]["metric"]) and args.turning_angle > math.abs(new_bear - locdata[i-1]['bearing']) % 360 > 360-args.turning_angle:
+                    while i in locdata and not (meters >= locdata[i-1]["metric"] and meters<=locdata[i]["metric"]):
+                        angle = (new_bear - locdata[i-1]["bearing"]) % 360
+                        if args.turning_angle < min(angle, 360-angle):
+                            break
                         i+=1
                 else:
                     while i in locdata and not (meters >= locdata[i-1]["metric"] and meters<=locdata[i]["metric"]):
