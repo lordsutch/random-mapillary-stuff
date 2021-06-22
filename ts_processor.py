@@ -37,6 +37,8 @@ parser.add_argument('--crop_top', default = '0', type=int) #number of pixels to 
 parser.add_argument('--crop_bottom', default = '0', type=int) #number of pixels to crop from bottom
 parser.add_argument('--make', type=str) #set camera make to be written in EXIF
 parser.add_argument('--model', type=str) #set camera model to be written in EXIF
+parser.add_argument('--turning-angle', default=0, type=int,
+                    help="override metric_distance when bearing changes by specified number of degrees")
 args = parser.parse_args()
 print(args)
 input_ts_file = args.input
@@ -748,8 +750,12 @@ for input_ts_file in inputfiles:
             if args.metric_distance > 0:
                 meters = meters + args.metric_distance
                 i = 1
-                while i in locdata and not (meters >= locdata[i-1]["metric"] and meters<=locdata[i]["metric"]):
-                    i+=1
+                if args.turning_angle:
+                    while i in locdata and not (meters >= locdata[i-1]["metric"] and meters<=locdata[i]["metric"]) and math.abs(new_bear - locdata[i-1]['bearing']) % 360 < args.turning_angle]:
+                        i+=1
+                else:
+                    while i in locdata and not (meters >= locdata[i-1]["metric"] and meters<=locdata[i]["metric"]):
+                        i+=1
                 if i in locdata and meters >= locdata[i-1]["metric"] and meters<=locdata[i]["metric"]:
                     try:
                         framecount = int(i*fps + fps * float(meters-locdata[i]["metric"])/float(locdata[i]["prevdist"]))
@@ -757,7 +763,7 @@ for input_ts_file in inputfiles:
                         framecount = int(i*fps)
                 else:
                     framecount = length + 1
-                
+
             else:
                 framecount += int(fps*args.sampling_interval)
             #print('Frame: ', framecount)
