@@ -692,6 +692,8 @@ for input_ts_file in inputfiles:
         if args.model:
             model = args.model
         success,image = video.read()
+        i = 1
+        turning = False
         while success:
 
             if True:
@@ -749,24 +751,37 @@ for input_ts_file in inputfiles:
 
             if args.metric_distance > 0:
                 meters = meters + args.metric_distance
-                i = 1
                 if args.turning_angle:
                     while i in locdata and not (meters >= locdata[i-1]["metric"] and meters<=locdata[i]["metric"]):
-                        angle = (new_bear - locdata[i-1]["bearing"]) % 360
-                        if args.turning_angle < min(angle, 360-angle):
-                            break
                         i+=1
+                        # Lookahead so we capture start of turn
+                        if i in locdata:
+                            angle = (locdata[i]["bearing"]-new_bear) % 360
+                            if args.turning_angle < min(angle, 360-angle):
+                                # print(turning, i, repr(locdata[i]))
+                                meters = locdata[i]["metric"]
+                                turning = True
+                                break
+                            if turning:
+                                turning = False
+                                # print(turning, i, repr(locdata[i]))
+                                meters = locdata[i]["metric"]
+                                break
+                    # print(i, angle, meters, locdata[i-1]["metric"])
                 else:
                     while i in locdata and not (meters >= locdata[i-1]["metric"] and meters<=locdata[i]["metric"]):
                         i+=1
-                if i in locdata and meters >= locdata[i-1]["metric"] and meters<=locdata[i]["metric"]:
+                # if i in locdata:
+                #     print(i, locdata[i-1]["metric"], locdata[i]["metric"])
+                # else:
+                #     print('No', i)
+                if i in locdata and (meters >= locdata[i-1]["metric"] and meters<=locdata[i]["metric"]):
                     try:
-                        framecount = int(i*fps + fps * float(meters-locdata[i]["metric"])/float(locdata[i]["prevdist"]))
+                        framecount = int(i*fps + fps * float(locdata[i-1]["metric"]-locdata[i]["metric"])/float(locdata[i]["prevdist"]))
                     except:
                         framecount = int(i*fps)
                 else:
                     framecount = length + 1
-
             else:
                 framecount += int(fps*args.sampling_interval)
             #print('Frame: ', framecount)
