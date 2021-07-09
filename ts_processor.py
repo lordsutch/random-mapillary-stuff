@@ -750,7 +750,7 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
                   bearing_modifier: float=0, use_speed=False, limit: int=0,
                   max_aperature=None, rotate: float=0, output_format='jpeg',
                   focal_length=None, min_coverage=90,
-                  csv_out=False, gpx_out=False) -> int:
+                  csv_out=False, gpx_out=False, dry_run=False) -> int:
     logger = multiprocessing.get_logger()
     # logger = logging.getLogger('process_video.'+input_ts_file)
     logger.info('Processing %s', input_ts_file)
@@ -824,6 +824,9 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
         
     ###Logging
 
+    if not os.path.exists(folder) and not dry_run:
+        os.makedirs(folder)
+    
     fnbase, _ = os.path.splitext(os.path.join(folder, os.path.basename(input_ts_file)))
     fnbase += '_'
     if csv_out:
@@ -926,14 +929,14 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
         locdata_ts[clock] = gps_loc
         
     ###Logging
-    if csv_out:
+    if csv_out and not dry_run:
         with open(f'{fnbase}post_interp.csv', 'w', newline='') as fd:
             csvfile = csv.DictWriter(fd, fieldnames=locdata[0].keys(),
                                      delimiter=';')
             csvfile.writeheader()
             csvfile.writerows(locdata.values())
 
-    if gpx_out:
+    if gpx_out and not dry_run:
         gpxtree = build_gpxtree(locdata, make, model)
         gpxtree.write(f'{fnbase}post_interp.gpx')
 
@@ -944,11 +947,13 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
                        input_ts_file)
         return
 
-    logger.info("Extraction started: %s", input_ts_file)
+    if dry_run:
+        logger.info("Would be extracting from %s now", input_ts_file)
+    else:
+        logger.info("Extraction started: %s", input_ts_file)
+
     framecount = 0
-    errormessage = 0
     count = 0
-    # meters = 0
     success, image = video.read()
     turning = False
 
@@ -1069,7 +1074,7 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
             ext = EXTENSIONS.get(output_format.lower(), output_format.lower())
             
             jpgname = f'{fnbase}{count:06d}.{ext}'
-            logger.debug('Saving %s', jpgname)
+            logger.debug('Would save %s' if dry_run else 'Saving %s', jpgname)
 
             # cv2.imwrite(jpgname, image, JPEG_SETTINGS)
 
@@ -1090,11 +1095,11 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
                 width=width, height=height, exifdata=exifdata,
                 thumbnail=raw_thumbnail)
 
-            pil_image.save(jpgname, output_format, **PIL_SAVE_SETTINGS,
-                           exif=exif_bytes)
+            if not dry_run:
+                pil_image.save(jpgname, output_format, **PIL_SAVE_SETTINGS,
+                               exif=exif_bytes)
 
             posinfo['photo'] = jpgname
-            # meters = posinfo['metric']
             next_distance = posinfo['metric'] + metric_distance
             lastframe = posinfo
             count += 1
@@ -1109,13 +1114,18 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
             useframe = False
         
     video.release()
+    if dry_run:
+        logger.info('%s processed; would have extracted %d image(s)',
+                    input_ts_file, count)
+        return 0
+
     logger.info('%s processed; %d image(s) extracted', input_ts_file, count)
 
-    if gpx_out:
+    if gpx_out and not dry_run:
         gpxtree = build_gpxtree(photos, make, model, generate_track=False)
         gpxtree.write(f'{fnbase}photos.gpx')
 
-    if kml_out:
+    if kml_out and not dry_run:
         kmltree = build_kml(photos, make, model)
         kmltree.write(f'{fnbase}photos.kml')
 
@@ -1266,6 +1276,8 @@ def main():
                        action='store_const', dest='loglevel',
                        const=logging.DEBUG, default=logging.INFO,
                        help='show debugging messages too')
+    parser.add_argument('--dry-run', '-n', action='store_true',
+                        help="run but don't save anything to disk")
 
     args = parser.parse_args()
     # print(args)
@@ -1301,12 +1313,11 @@ def main():
     else:
         mask = None
 
-    try:
-        os.makedirs(args.folder)
-    except:
-        pass
-
+    if args.dry_run:
+        logger.warning('*** Dry run - no data saved ***')
+    
     if args.parallel == 1:
+        cgitb.enable(format='text')
         for filename in inputfiles:
             process_video(
                 filename, args.folder,
@@ -1328,7 +1339,7 @@ def main():
                 max_aperature=args.max_aperature, limit=args.limit,
                 rotate=args.rotate, output_format=args.output_format,
                 focal_length=args.focal_length, thumbnails=args.thumbnails,
-                kml_out=args.kml, config=config)
+                kml_out=args.kml, config=config, dry_run=args.dry_run)
         return
 
     threads = []
@@ -1354,7 +1365,7 @@ def main():
             max_aperature=args.max_aperature, limit=args.limit,
             rotate=args.rotate, output_format=args.output_format,
             focal_length=args.focal_length, thumbnails=args.thumbnails,
-            kml_out=args.kml, config=config)
+            kml_out=args.kml, config=config, dry_run=args.dry_run)
                    for filename in inputfiles]
         
         for thread in threads:
