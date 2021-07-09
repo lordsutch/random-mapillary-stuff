@@ -19,7 +19,6 @@ import struct
 import sys
 from collections.abc import Mapping
 from datetime import datetime, timezone, timedelta, tzinfo
-from dataclasses import dataclass
 from decimal import Decimal
 from fractions import Fraction
 from typing import Optional
@@ -51,7 +50,7 @@ PIL_SAVE_SETTINGS = dict(quality=80,
                          optimize=False,
                          progressive=True)
 
-EXTENSIONS = {'jpeg' : 'jpg'}
+EXTENSIONS = {'jpeg': 'jpg'}
 
 JPEG_SETTINGS = (cv2.IMWRITE_JPEG_OPTIMIZE, 1,
                  cv2.IMWRITE_JPEG_PROGRESSIVE, 1,
@@ -114,10 +113,10 @@ def rotatedRectWithMaxArea(w, h, angle):
     axis-aligned rectangle (maximal area) within the rotated rectangle.
     """
     if w <= 0 or h <= 0:
-        return 0,0
+        return 0, 0
 
     width_is_longer = w >= h
-    side_long, side_short = (w,h) if width_is_longer else (h,w)
+    side_long, side_short = (w, h) if width_is_longer else (h,w)
 
     # since the solutions for angle, -angle and 180-angle are all the same,
     # if suffices to look at the first quadrant and the absolute values of sin,cos:
@@ -126,13 +125,13 @@ def rotatedRectWithMaxArea(w, h, angle):
         # half constrained case: two crop corners touch the longer side,
         #   the other two corners are on the mid-line parallel to the longer line
         x = 0.5*side_short
-        wr,hr = (x/sin_a,x/cos_a) if width_is_longer else (x/cos_a,x/sin_a)
+        wr, hr = (x/sin_a, x/cos_a) if width_is_longer else (x/cos_a, x/sin_a)
     else:
         # fully constrained case: crop touches all 4 sides
         cos_2a = cos_a*cos_a - sin_a*sin_a
-        wr,hr = (w*cos_a - h*sin_a)/cos_2a, (h*cos_a - w*sin_a)/cos_2a
+        wr, hr = (w*cos_a - h*sin_a)/cos_2a, (h*cos_a - w*sin_a)/cos_2a
         
-    return wr,hr
+    return wr, hr
 
 
 def change_to_rational(number):
@@ -148,8 +147,8 @@ EXIF_MAPPER = {
                       change_to_rational),
     'focal length': (piexif.ExifIFD.FocalLength, change_to_rational),
     '35mm equivalent focal length': (piexif.ExifIFD.FocalLengthIn35mmFilm, int),
-    'focal plane x resolution' : (piexif.ExifIFD.FocalPlaneXResolution, change_to_rational),
-    'focal plane y resolution' : (piexif.ExifIFD.FocalPlaneYResolution, change_to_rational),
+    'focal plane x resolution': (piexif.ExifIFD.FocalPlaneXResolution, change_to_rational),
+    'focal plane y resolution': (piexif.ExifIFD.FocalPlaneYResolution, change_to_rational),
 }
 
 # A129 Pro
@@ -1097,106 +1096,6 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
         kmltree.write(f'{fnbase}photos.kml')
 
         
-def crap():
-    #interpolate time and coordinates
-    prev_dataframe = int((framecount+timeshift*fps)/fps)
-    while prev_dataframe+1 not in locdata and prev_dataframe >= length/fps - 2:
-        prev_dataframe -= 1
-
-    if prev_dataframe in locdata and prev_dataframe + 1 in locdata:
-        current_position = math.fmod(framecount / fps, 1.0)
-        # current_position = (framecount)/fps + timeshift - prev_dataframe
-
-        # current_position = (framecount + timeshift*fps - prev_dataframe*fps)/fps
-        # print('Hi', prev_dataframe, current_position)
-        posinfo = interpolate_locdata(
-            locdata[prev_dataframe], locdata[prev_dataframe+1],
-            position=current_position)
-
-        if posinfo['speed'] >= min_speed or metric_distance:
-            new_speed = posinfo['speed']
-            new_lat = posinfo['lat']
-            new_lon = posinfo['lon']
-            new_bear = posinfo['bearing']
-            if mask:
-                image = cv2.bitwise_and(image, image, mask=mask)
-
-            if crop:
-                crop_top, crop_bottom, crop_left, crop_right = crop
-                height, width, _ = image.shape
-                image = image[crop_top : height - crop_bottom,
-                              crop_left : width - crop_right]
-            # cv2.imwrite("tmp.jpg", image)
-            new_ts = posinfo['ts']
-            datetime_taken = datetime.fromtimestamp(new_ts + tz*3600)
-
-            jpgname = f'{fnbase}{count:06d}.jpg'
-            cv2.imwrite(jpgname, image)
-            # shutil.copy2("tmp.jpg", jpgname)
-            set_gps_location(jpgname, new_lat, new_lon, new_bear, make, model, datetime_taken)
-            #print('Frame: ', framecount)
-            count += 1
-    elif errormessage == 0:
-        print ("No valid GPS for frame %d, this frame and others will be skipped." % framecount)
-        errormessage = 1
-
-    if metric_distance:
-        meters += metric_distance
-        if turning_angle:
-            while i in locdata and meters < locdata[i-1]["metric"]:
-            # while i in locdata and not (meters >= locdata[i-1]["metric"] and meters <= locdata[i]["metric"]):
-                logger.info('%d %f %s %s', i, meters, locdata[i-1], posinfo)
-                i+=1
-                # Lookahead so we capture start of turn
-                if i in locdata:
-                    # Stationary
-                    # print(new_speed, locdata[i], locdata[i-1])
-                    dist = WGS84.line_length(
-                        lats=(locdata[i-1]['lat'], new_lat),
-                        lons=(locdata[i-1]['lon'], new_lon))
-                    if dist < 2:
-                        continue
-
-                    angle = (locdata[i]["bearing"]-new_bear) % 360
-                    if turning_angle < min(angle, 360-angle):
-                        # print(turning, i, repr(locdata[i]))
-                        meters = locdata[i-1]["metric"]
-                        turning = True
-                        break
-                    elif turning:
-                        turning = False
-                        # print(turning, i, repr(locdata[i]))
-                        meters = locdata[i-1]["metric"]
-                        break
-            else:
-                while i in locdata and meters < locdata[i-1]["metric"]:
-                # while i in locdata and not (meters >= locdata[i-1]["metric"] and meters <= locdata[i]["metric"]):
-                    i+=1
-        # if i in locdata:
-        #     print(i, locdata[i-1]["metric"], locdata[i]["metric"])
-        # else:
-        #     print('No', i)
-        # print(i, meters, locdata[i-1]['metric'], locdata[i]['metric'])
-        if i in locdata and meters < locdata[i]["metric"]:
-        ## if i in locdata and not (meters >= locdata[i-1]["metric"] and meters <= locdata[i]["metric"]):
-            try:
-                framecount = int(i*fps + fps * float(meters-locdata[i]["metric"])/float(locdata[i]["prevdist"]))
-            except:
-                framecount = int(i*fps)
-        else:
-            framecount = length + 1
-    else:
-        framecount += int(fps*sampling_interval)
-    #print('Frame: ', framecount)
-    if suppress_cv2_warnings:
-        with suppress_stdout_stderr(): #Just to keep the console clear from OpenCV warning messages
-            video.set(1, framecount)
-            success, image = video.read()
-    else:
-        video.set(1, framecount)
-        success, image = video.read()
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('input', nargs='+', type=str,
@@ -1305,7 +1204,7 @@ def main():
 
         configfiles = [os.path.join(x, 'dashcam-photos.conf')
                        for x in xdgconfdirs]
-        configfiles.append( os.path.join(xdgconfdir, 'dashcam-photos.conf') )
+        configfiles.append(os.path.join(xdgconfdir, 'dashcam-photos.conf'))
 
     config = configparser.ConfigParser()
     config.read(configfiles)
