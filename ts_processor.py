@@ -16,8 +16,8 @@ import os
 import re
 import struct
 import sys
-import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
+from collections.abc import Mapping
+from datetime import datetime, timezone, timedelta, tzinfo
 from dataclasses import dataclass
 from decimal import Decimal
 from fractions import Fraction
@@ -28,6 +28,12 @@ import piexif
 import pyproj
 from pymp4.parser import Box
 from PIL import Image
+
+try:
+    from lxml import etree as ET
+except ImportError:
+    import xml.etree.ElementTree as ET
+
 
 WGS84 = pyproj.Geod(ellps='WGS84')
 Mercator = pyproj.Proj(proj='webmerc', datum='WGS84')
@@ -263,7 +269,7 @@ def metric_lonlat(xmx, ymy):
     # return xlon, xlat
 
 
-def decode_novatek_gps_packet(packet: bytes, packetno: int,
+def decode_novatek_gps_packet(packet: bytes, tz: tzinfo=timezone.utc,
                               logger=logging) -> Optional[dict]:
     # Different units and firmware seem to put the data in different places
     if m := re.search(rb'[NS][EW]', packet):
@@ -303,15 +309,13 @@ def decode_novatek_gps_packet(packet: bytes, packetno: int,
     speed = speed_knots * KNOTS_TO_MPS
     mx, my = lonlat_metric(lon, lat)
     ts = datetime(year=2000+year, month=month, day=day, hour=hour,
-                  minute=minute, second=second,
-                  tzinfo=timezone.utc).timestamp()
+                  minute=minute, second=second, tzinfo=tz)
 
     return dict(lat=lat, latR=lathem, lon=lon, lonR=lonhem,
                 bearing=bearing, speed=speed, mx=mx, my=my,
                 metric=0, prevdist=0, ts=ts)
 
 
-# TODO: Rewrite this using mmap
 def detect_file_type(input_file, device_override='', logger=logging):
     device = "X"
     make = "unknown"
@@ -320,102 +324,166 @@ def detect_file_type(input_file, device_override='', logger=logging):
     if input_file.lower().endswith(".ts"):
         with open(input_file, "rb") as f:
             device = "A"
-            input_packet = f.read(188) # First packet, try to autodetect
-            # input_packet = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
-            
-            if b"\xB0\x0D\x30\x34\xC3" in input_packet[4:20] or device_override == "V":
-                device = "V"
-                make = "Viofo"
-                model = "A119 V3"
-                
-            elif b"\xB0\x0D\x30\x34\xC3" in input_packet[20:40] or device_override == "S":
-                device = "S"
-                make = "Viofo"
-                model = "A119S"
+            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                input_packet = mm.read(188)
+                if b"\xB0\x0D\x30\x34\xC3" in input_packet[4:20] or device_override == "V":
+                    device = "V"
+                    make = "Viofo"
+                    model = "A119 V3"
+                elif b"\xB0\x0D\x30\x34\xC3" in input_packet[20:40] or device_override == "S":
+                    device = "S"
+                    make = "Viofo"
+                    model = "A119S"
+                elif b"\x40\x1F\x4E\x54\x39" in input_packet[4:20] or device_override == "B":
+                    device = "B"
+                    make = "Blueskysea"
+                    model = "B4K"
 
-            elif b"\x40\x1F\x4E\x54\x39" in input_packet[4:20] or device_override == "B":
-                device = "B"
-                make = "Blueskysea"
-                model = "B4K"
+                while device == "A":
+                    input_packet = mm.read(188)
+                    if not input_packet:
+                        break
 
-            while device == "A":
-                input_packet = f.read(188)
-                if not input_packet:
-                    break
-
-                #Autodetect camera type
-                if input_packet.startswith(b"\x47\x03\x00"):
-                    if decode_novatek_gps_packet(input_packet):
-                    # active, lathem, lonhem = struct.unpack_from(
-                    #     'ccc', input_packet[156:])
-                    # if lathem in b"NS" and lonhem in b"EW":
+                    #Autodetect camera type
+                    if input_packet.startswith(b"\x47\x03\x00") and decode_novatek_gps_packet(input_packet):
                         device = "B"
                         make = "Blueskysea"
                         model = "B4K"
                         logger.debug("Autodetected as Blueskysea B4K")
                         break
-
-                if input_packet.startswith(b"\x47\x43\x00"):
-                    if decode_novatek_gps_packet(input_packet):
-                    # active, lathem, lonhem = struct.unpack_from(
-                    #     'ccc', input_packet[34:])
-                    # if lathem in b"NS" and lonhem in b"EW":
-                    #     device = "V"
+                    elif input_packet.startswith(b"\x47\x43\x00") and decode_novatek_gps_packet(input_packet):
                         logger.debug("Autodetected as Viofo A119 V3")
                         make = "Viofo"
                         model = "A119 V3"
                         break
-                    # active, lathem, lonhem = struct.unpack_from(
-                    #     'ccc', input_packet[-20:])
-                    # if lathem in b"NS" and lonhem in b"EW":
-                    #     device = "S"
-                    #     logger.debug("Autodetected as Viofo A119S")
-                    #     make = "Viofo"
-                    #     model = "A119S"
-                    #     break
 
     ## This would probably be faster if mmap() is used
     if input_file.lower().endswith(".mp4"):
         # Guess which MP4 method is used: Novatek, Subtitle, NMEA
         with open(input_file, "rb") as fx:
-            # mm = mmap.mmap(fx.fileno(), 0)
-            fx.seek(0, io.SEEK_END)
-            eof = fx.tell()
-            fx.seek(0)
-            lines = []
-            while fx.tell() < eof:
+            with mmap.mmap(fx.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                eof = mm.size()
+                while mm.tell() < eof:
+                    try:
+                        box = Box.parse_stream(mm)
+                    except:
+                        pass
+                    #print (box.type.decode("utf-8"))
+                    if box.type == b"free":
+                        length = len(box.data)
+                        offset = 0
+                        while offset < length:
+                            inp = Box.parse(box.data[offset:])
+                            #print (inp.type.decode("utf-8"))
+                            if inp.type == b"gps": #NMEA-based
+                                lines = inp.data
+                                for line in lines.splitlines():
+                                    # m = str(line).lstrip("[]0123456789")
+                                    if b"$GPGGA" in line:
+                                        device = "N"
+                                        make = "NMEA-based video"
+                                        model = "unknown"
+                                        break
+                            offset += inp.end
+                    elif box.type == b"gps": #has Novatek-specific stuff
+                        mm.seek(0)
+                        # largeelem = fx.read()
+                        if mm.find(b'freeGPS') >= 0:
+                            make = "Novatek"
+                            model = "MP4"
+                            device = "T"
+                            break
+                    elif box.type == b"moov":
+                        try:
+                            length = len(box.data)
+                        except:
+                            length = 0
+                        offset = 0
+                        while offset < length:
+                            inp = Box.parse(box.data[offset:])
+                            if inp.type == b"gps": #NMEA-based
+                                for line in lines.splitlines():
+                                    if b"$GPGGA" in line:
+                                        device = "N"
+                                        make = "NMEA-based video"
+                                        model = "unknown"
+                                        break
+
+                            offset += inp.end
+
+            if device == "X":
+                if mm.find(b'\x00\x14\x50\x4E\x44\x4D\x00\x00\x00\x00') >= 0:
+                    make = "Garmin"
+                    model = "unknown"
+                    device = "G"
+
+    return device, make, model
+
+def get_gps_data_nt (input_ts_file, device, tz, logger=logging):
+    packetno = 0
+    locdata = {}
+    with open(input_ts_file, "rb") as f:
+        with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+            for match in re.finditer(b'freeGPS', mm):
+                input_packet = mm[match.start()+2:match.start()+188]
+                if currentdata := decode_novatek_gps_packet(
+                        input_packet, tz, logger):
+                    locdata[packetno] = currentdata
+                    packetno += 1
+
+    return locdata, packetno
+
+garmin_gps_struct = struct.Struct('>s xx i i')
+
+def get_gps_data_garmin (input_ts_file, device, tz):
+    packetno = 0
+    locdata = {}
+    
+    with open(input_ts_file, "rb") as f:
+        with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+            for match in re.finditer(b'\x00\x14\x50\x4E\x44\x4D\x00\x00\x00\x00', mm):
+                input_packet = mm[match.start():match.start()+56]
+                speed_kmh, lat, lon = garmin_gps_struct.unpack_from(input_packet)
+                lat /= 11930464.711111112
+                lon /= 11930464.711111112
+                mx, my = lonlat_metric(lon, lat)
+                
+                locdata[packetno] = dict(
+                    speed=speed_kmh / 3.6,
+                    bearing=0, ts=datetime.fromtimestamp(0, timezone.utc),
+                    lat=lat, lon=lon, mx=mx, my=my,
+                    latR=b'N' if lat >= 0 else b'S',
+                    lonR=b'E' if lon >= 0 else b'W',
+                    prevdist=0, metric=0)
+                packetno += 1
+                
+    return locdata, packetno
+
+
+def parse_nmea_rmc(line: bytes, tzone='Z') -> dict:
+    bits = line.split(b',')
+    datestr = f'{bits[9]} {bits[1]}{tzone}'
+    ts = datetime.strptime( datestr, '%d%m%y %H%M%S.%f%z')
+    mx, my = lonlat_metric(lon, lat)
+    return dict(ts=ts, active=bits[2], lat=lat, latR=lathem, lon=lon,
+                lonR=lonhem, mx=mx, my=my, speed=float(bits[7])*KNOTS_TO_MPS,
+                bearing=float(bits[8]), metric=0, prevdist=0)
+                                    
+
+def get_gps_data_nmea (input_file, device, tz):
+    packetno = 0
+    locdata = {}
+     
+    with open(input_file, "rb") as fx:
+        with mmap.mmap(fx.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+            eof = mm.size()
+            prevts = datetime.fromtimestamp(0, timezone.utc)
+            while mm.tell() < eof:
                 try:
                     box = Box.parse_stream(fx)
                 except:
                     pass
-                #print (box.type.decode("utf-8"))
-                if box.type.decode("utf-8") == "free":
-                    length = len(box.data)
-                    offset = 0
-                    while offset < length:
-                        inp = Box.parse(box.data[offset:])
-                        #print (inp.type.decode("utf-8"))
-                        if inp.type.decode("utf-8") == "gps": #NMEA-based
-                            lines = inp.data
-                            for line in lines.splitlines():
-                                m = str(line).lstrip("[]0123456789")
-                                if "$GPGGA" in m:
-                                    device = "N"
-                                    make = "NMEA-based video"
-                                    model = "unknown"
-                                    break
-                        offset += inp.end
-                if box.type == b"gps": #has Novatek-specific stuff
-                    fx.seek(0)
-                    largeelem = fx.read()
-                    startbytes = [m.start() for m in re.finditer(b'freeGPS', largeelem)]
-                    if startbytes:
-                        make = "Novatek"
-                        model = "MP4"
-                        device = "T"
-                        break
-
-                if box.type == b"moov":
+                if box.type == b"free":
                     try:
                         length = len(box.data)
                     except:
@@ -424,215 +492,98 @@ def detect_file_type(input_file, device_override='', logger=logging):
                     while offset < length:
                         inp = Box.parse(box.data[offset:])
                         #print (inp.type.decode("utf-8"))
-                        if inp.type.decode("utf-8") == "gps": #NMEA-based
+                        if inp.type == b"gps": #NMEA-based
                             lines = inp.data
-                            print (len(inp.data))
                             for line in lines.splitlines():
-                                m = str(line).lstrip("[]0123456789")
-                                if "$GPGGA" in m:
-                                    device = "N"
-                                    make = "NMEA-based video"
-                                    model = "unknown"
-                                    #break
+                                if b"$GPRMC" in line:
+                                    currentdata = parse_nmea_rmc(line, tzstr)
+                                    if active == b'A' and ts > prevts:
+                                        locdata[packetno] = currentdata
+                                        prevts = ts
+                                        packetno += 1
                         offset += inp.end
-
-        if device == "X":
-            fx.seek(0)
-            largeelem = fx.read()
-            startbytes = [m.start() for m in re.finditer(b'\x00\x14\x50\x4E\x44\x4D\x00\x00\x00\x00', largeelem)]
-            del largeelem
-            if len(startbytes)>0:
-                make = "Garmin"
-                model = "unknown"
-                device = "G"
-
-    return device,make,model
-
-def get_gps_data_nt (input_ts_file, device, logger=logging):
-    packetno = 0
-    locdata = {}
-    with open(input_ts_file, "rb") as f:
-        largeelem = f.read()
-        startbytes = [m.start() for m in re.finditer(b'freeGPS', largeelem)]
-        for startbyte in startbytes:
-            input_packet = largeelem[startbyte+2:startbyte+188]
-            if currentdata := decode_novatek_gps_packet(input_packet, logger):
-                locdata[packetno] = currentdata
-            packetno += 1
-
-    return locdata, packetno
-
-def get_gps_data_garmin (input_ts_file, device):
-    packetno = 0
-    locdata = {}
-    with open(input_ts_file, "rb") as f:
-        largeelem = f.read()
-        startbytes = [m.start() for m in re.finditer(b'\x00\x14\x50\x4E\x44\x4D\x00\x00\x00\x00', largeelem)]
-        for startbyte in startbytes:
-            currentdata = {}
-            input_packet = largeelem[startbyte:startbyte+56]
-            bs = list(input_packet)
-            active = 0
-            lathem = 0
-            lonhem = 0
-            lat = int.from_bytes(input_packet[14:18], byteorder='big') / 11930464.711111112
-            lon = int.from_bytes(input_packet[18:22], byteorder='big') / 11930464.711111112
-            speed_knots = float(int.from_bytes(input_packet[10:11], byteorder='big'))
-            speed = speed_knots * KNOTS_TO_MPS
-            bearing = 0 #struct.unpack('<f', input_packet[50:54])
-            currentdata["ts"] = 0 #datetime(year=2000+year, month=month, day=day, hour=hour, minute=minute, second=second).replace(tzinfo=timezone.utc).timestamp()
-            currentdata["lat"] = lat
-            currentdata["latR"] = lathem
-            currentdata["lon"] = lon
-            currentdata["lonR"] = lonhem
-            currentdata["bearing"] = bearing
-            currentdata["speed"] = speed
-            currentdata["mx"],currentdata["my"] = lonlat_metric(lon,lat)
-            currentdata["metric"] = 0
-            currentdata["prevdist"] = 0
-            locdata[packetno] = currentdata
-            packetno += 1
-            #print (0,active,lathem,lonhem,lat,lon,speed,bearing, sep=';')
-
-            del currentdata
-    del largeelem
+            
     return locdata, packetno
 
 
-def get_gps_data_nmea (input_file, device):
-    packetno = 0
-    locdata = {}
-    with open(input_file, "rb") as fx:
-        fx.seek(0, io.SEEK_END)
-        eof = fx.tell()
-        fx.seek(0)
-        prevts = 0
-        lines = []
-        while fx.tell() < eof:
-            try:
-                box = Box.parse_stream(fx)
-            except:
-                pass
-            if box.type.decode("utf-8") == "free":
-                try:
-                    length = len(box.data)
-                except:
-                    length = 0
-                offset = 0
-                while offset < length:
-                    inp = Box.parse(box.data[offset:])
-                    #print (inp.type.decode("utf-8"))
-                    if inp.type.decode("utf-8") == "gps": #NMEA-based
-
-                        lines = inp.data
-
-                        for line in lines.splitlines():
-                            m = str(line)
-                            if "$GPRMC" in m:
-                                currentdata = {}
-                                currentdata["ts"] = int(m[3:13])
-
-                                currentdata["lat"] = float(m.split(",")[3][0:2]) + float(m.split(",")[3][2:]) / 60
-                                currentdata["latR"] = m.split(",")[4]
-                                if currentdata["latR"] == "S":
-                                    currentdata["lat"] = - currentdata["lat"]
-
-                                currentdata["lon"] = float(m.split(",")[5][0:3]) + float(m.split(",")[5][3:]) / 60
-                                currentdata["lonR"] = m.split(",")[6]
-                                if currentdata["lonR"] == "N":
-                                    currentdata["lon"] = - currentdata["lon"]
-                                active = (m.split(",")[2])
-                                nts = currentdata["ts"]
-
-                                currentdata["bearing"] = float(m.split(",")[9])
-                                currentdata["speed"] = float(m.split(",")[8])*KNOTS_TO_MPS
-                                currentdata["mx"],currentdata["my"] = lonlat_metric(currentdata["lon"],currentdata["lat"])
-                                currentdata["metric"] = 0
-                                currentdata["prevdist"] = 0
-                                if active == "A" and nts > prevts:
-                                    locdata[packetno] = currentdata
-                                    prevts = nts
-                                    packetno += 1
-
-                                del currentdata
-                    offset += inp.end
-
-    return locdata, packetno
-
-def get_gps_data_ts (input_ts_file, device, logger=logging):
+def get_gps_data_ts (input_ts_file, device, tz, logger=logging):
     packetno = 0
     locdata = {}
     prevdata = {}
     # prevpacket = None
     with open(input_ts_file, "rb") as f:
-        input_packet = f.read(188) #First packet, try to autodetect
+        with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+            input_packet = mm.read(188) #First packet, try to autodetect
 
-        while True:
-            currentdata = {}
-            input_packet = f.read(188)
-            if not input_packet:
-                break
+            while True:
+                input_packet = mm.read(188)
+                if not input_packet:
+                    break
 
-            if device == 'B' and prevdata and input_packet.startswith(b"\x47\x03\x00"):
-                if currentdata := decode_novatek_gps_packet(input_packet, logger):
-                    # Combine data from the two packets
-                    subdict = dict(hour=prevdata['hour'],
-                                   minute=prevdata['minute'],
-                                   second=prevdata['second'],
-                                   year=prevdata['year'],
-                                   month=prevdata['month'],
-                                   day=prevdata['day'])
-                    packetdata, prevdata = currentdata.copy(), currentdata
-                    packetdata.update(subdict)
-                    locdata[packetno] = packetdata
+                currentdata = {}
+                if device == 'B' and prevdata and input_packet.startswith(b"\x47\x03\x00"):
+                    if currentdata := decode_novatek_gps_packet(input_packet, tz, logger):
+                        # Combine data from the two packets
+                        subdict = dict(hour=prevdata['hour'],
+                                       minute=prevdata['minute'],
+                                       second=prevdata['second'],
+                                       year=prevdata['year'],
+                                       month=prevdata['month'],
+                                       day=prevdata['day'])
+                        packetdata, prevdata = currentdata.copy(), currentdata
+                        packetdata.update(subdict)
+                        locdata[packetno] = packetdata
+                        packetno += 1
+                elif device in ('V', 'S') and input_packet.startswith(b"\x47\x43\x00"):
+                    if currentdata := decode_novatek_gps_packet(input_packet, tz, logger):
+                        locdata[packetno] = currentdata
+                        prevdata = currentdata
                     packetno += 1
-
-            if device in ('V', 'S') and input_packet.startswith(b"\x47\x43\x00"):
-                if currentdata := decode_novatek_gps_packet(input_packet, logger):
-                    locdata[packetno] = currentdata
-                    prevdata = currentdata
-                packetno += 1
 
     return locdata, packetno
 
 
-def build_gpxtree(locdata: dict, make: str, model: str,
-                  tz=0) -> ET.ElementTree:
+def build_gpxtree(locdata: dict, make: str, model: str) -> ET.ElementTree:
     gpx = ET.Element('gpx', version='1.0', creator='ts_processor')
     desc = ET.SubElement(gpx, 'desc')
     desc.text = f'Trace from {make} {model}'
     metatime = ET.SubElement(gpx, 'time')
-    maxtime = 0
+    maxtime = datetime.fromtimestamp(0, timezone.utc)
     bounds = ET.SubElement(gpx, 'bounds')
     minlat, maxlat = 100, -100
     minlon, maxlon = 200, -200
     track = ET.SubElement(gpx, 'trk')
     trkseg = ET.SubElement(track, 'trkseg')
 
-    i = 0
-    while i in locdata.keys():
-        lat, lon = locdata[i]['lat'], locdata[i]['lon']
+    if isinstance(locdata, Mapping):
+        iterator = locdata.items()
+    else:
+        iterator = enumerate(locdata)
+    
+    for i, fix in iterator:
+        lat, lon = fix['lat'], fix['lon']
         minlat, maxlat = min(minlat, lat), max(maxlat, lat)
         minlon, maxlon = min(minlon, lon), max(maxlon, lon)
 
         trkpt = ET.SubElement(trkseg, 'trkpt', lat=f"{lat:.6f}", lon=f"{lon:.6f}")
-        ts = locdata[i]['ts']+tz*3600
+        ts = fix['ts']
         maxtime = max(maxtime, ts)
         time = ET.SubElement(trkpt, 'time')
-        time.text = datetime.utcfromtimestamp(ts).isoformat()
+        time.text = ts.isoformat()
         course = ET.SubElement(trkpt, 'course')
-        course.text = f"{locdata[i]['bearing']:.1f}"
-        comment = ET.SubElement(trkpt, 'comment')
-        comment.text = f'track point {i}'
+        course.text = f"{fix['bearing']:.1f}"
+        if photo := fix.get('photo'):
+            comment = ET.SubElement(trkpt, 'name')
+            comment.text = photo
+        # comment.text = f'track point {i}'
         speed = ET.SubElement(trkpt, 'speed')
-        speed.text = f"{locdata[i]['speed']:.1f}"
-        i += 1
+        speed.text = f"{fix['speed']:.1f}"
 
     bounds.set('minlat', f"{minlat:.6f}")
     bounds.set('maxlat', f"{maxlat:.6f}")
     bounds.set('minlon', f"{minlon:.6f}")
     bounds.set('maxlon', f"{maxlon:.6f}")
-    metatime.text = datetime.utcfromtimestamp(maxtime).isoformat()
+    metatime.text = maxtime.isoformat()
     return ET.ElementTree(gpx)
 
 
@@ -756,14 +707,16 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
         interval = 1
     locdata = {}
     packetno = 0
+
+    tzone = timezone(timedelta(hours=tz))
     if device in "BVS":
-        locdata, packetno = get_gps_data_ts(input_ts_file, device, logger)
+        locdata, packetno = get_gps_data_ts(input_ts_file, device, tzone, logger)
     elif device in "T":
-        locdata, packetno = get_gps_data_nt(input_ts_file, device, logger)
+        locdata, packetno = get_gps_data_nt(input_ts_file, device, tzone, logger)
     elif device in "N":
-        locdata, packetno = get_gps_data_nmea(input_ts_file, device)
+        locdata, packetno = get_gps_data_nmea(input_ts_file, device, tzone)
     elif device in "G":
-        locdata, packetno = get_gps_data_garmin(input_ts_file, device)
+        locdata, packetno = get_gps_data_garmin(input_ts_file, device, tzone)
 
     logger.debug("GPS data analysis ended; %d points", len(locdata))
     if packetno:
@@ -780,9 +733,8 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
             csvfile.writerows(locdata.values())
 
     if gpx_out:
-        gpxtree = build_gpxtree(locdata, make, model, tz)
-        with open(f'{fnbase}pre_interp.gpx', 'wb') as fd:
-            gpxtree.write(fd)
+        gpxtree = build_gpxtree(locdata, make, model)
+        gpxtree.write(f'{fnbase}pre_interp.gpx')
     ###
 
     # Remove any insane coordinate values
@@ -883,7 +835,8 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
     locdata_ts = {}
     for i, gps_loc in locdata.items():
         # print(i, gps_loc)
-        locdata_ts[ gps_loc['ts'] ] = gps_loc
+        clock = gps_loc['posix_clock'] = gps_loc['ts'].timestamp()
+        locdata_ts[clock] = gps_loc
         
     ###Logging
     if csv_out:
@@ -894,9 +847,8 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
             csvfile.writerows(locdata.values())
 
     if gpx_out:
-        gpxtree = build_gpxtree(locdata, make, model, tz)
-        with open(f'{fnbase}post_interp.gpx', 'wb') as fd:
-            gpxtree.write(fd)
+        gpxtree = build_gpxtree(locdata, make, model)
+        gpxtree.write(f'{fnbase}post_interp.gpx')
 
     ###
 
@@ -909,7 +861,7 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
     framecount = 0
     errormessage = 0
     count = 0
-    meters = 0
+    # meters = 0
     success, image = video.read()
     turning = False
 
@@ -920,10 +872,11 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
     useframe = True
     next_distance = 0
     thumbnail = None
-    
+
+    photos = []
     while success and framecount < length and (not limit or count < limit):
         # Interpolate time and coordinates
-        current_time = locdata[0]['ts'] + (framecount/fps)
+        current_time = locdata[0]['posix_clock'] + (framecount/fps)
 
         prevts = (ts for ts in timestamps if ts <= current_time + timeshift)
         nextts = (ts for ts in timestamps if ts > current_time + timeshift)
@@ -944,8 +897,9 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
         # logger.debug(currentpos)
         # logger.debug(lastframe)
         # logger.debug(posinfo)
-        if use_sampling_interval and not lastframe or (
-                current_time - lastframe.get('ts', 0)) > sampling_interval:
+        
+        if (use_sampling_interval and not lastframe or
+            current_time-lastframe.get('posix_clock', 0) > sampling_interval):
             useframe = True
             
         if metric_distance and not turning_angle:
@@ -1019,8 +973,8 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
                      height - crop_bottom) )
                 width, height = pil_image.size
 
-            new_ts = posinfo['ts']
-            datetime_taken = datetime.fromtimestamp(new_ts + tz*3600)
+            datetime_taken = posinfo['ts']
+            # datetime_taken = datetime.fromtimestamp(new_ts + tz*3600)
 
             ext = EXTENSIONS.get(output_format.lower(), output_format.lower())
             
@@ -1045,11 +999,12 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
             pil_image.save(jpgname, output_format, **PIL_SAVE_SETTINGS,
                            exif=exif_bytes)
 
-
+            posinfo['photo'] = jpgname
+            # meters = posinfo['metric']
+            next_distance = posinfo['metric'] + metric_distance
             lastframe = posinfo
-            meters = posinfo['metric']
-            next_distance = meters + metric_distance
             count += 1
+            photos.append(posinfo)
 
         # End of loop
         if not metric_distance and not turning_angle:
@@ -1062,6 +1017,9 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
     video.release()
     logger.info('%s processed; %d image(s) extracted', input_ts_file, count)
 
+    if gpx_out:
+        gpxtree = build_gpxtree(photos, make, model)
+        gpxtree.write(f'{fnbase}photos.gpx')
 
 def crap():
     #interpolate time and coordinates
@@ -1176,7 +1134,7 @@ def main():
                         help='output format to use; jpeg is default')
     parser.add_argument('--timeshift', default=0, type=float,
                         help='time shift in seconds, if the GPS and video seem out of sync')
-    parser.add_argument('--timezone', default=0, type=float,
+    parser.add_argument('--timezone', default=0, type=Decimal,
                         help='timezone difference in hours. Depends on video source, some provide GMT, others local')
     parser.add_argument('--min-speed', '--min_speed', default=-1, type=float,
                         help='minimum speed in m/s to filter out stops')
