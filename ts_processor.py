@@ -945,7 +945,10 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
         current_time = locdata[0]['posix_clock'] + (framecount/fps)
 
         prevts = (ts for ts in timestamps if ts <= current_time + timeshift)
-        nextts = (ts for ts in timestamps if ts > current_time + timeshift)
+        nextts = [ts for ts in timestamps if ts > current_time + timeshift]
+
+        if not nextts:
+            break
         
         prev_fix = max(prevts)
         next_fix = min(nextts)
