@@ -2,6 +2,7 @@
 #Usage: python ts_processor.py --input 20210311080720_000421.TS  --sampling_interval 0.5 --folder output
 
 import argparse
+# import base64
 import concurrent.futures
 import configparser
 import csv
@@ -43,7 +44,9 @@ KNOTS_TO_MPS = 1852.0 / 3600.0
 
 DATETIME_STR_FORMAT = '%Y:%m:%d %H:%M:%S'
 
-THUMB_WIDTH = 60
+THUMB_SIZE = 200
+THUMB_QUALITY = 60
+
 PIL_SAVE_SETTINGS = dict(quality=80,
                          optimize=False,
                          progressive=True)
@@ -218,9 +221,7 @@ def build_exif_data(lat, lng, bear, make, model, datetm,
     exif_dict = {"0th":zeroth_ifd,"Exif":exif_ifd,"GPS": gps_ifd,'1st': {}}
 
     if thumbnail:
-        o = io.BytesIO()
-        thumbnail.save(o, 'jpeg', quality=50)
-        exif_dict['thumbnail'] = o.getvalue()
+        exif_dict['thumbnail'] = thumbnail
     
     exif_bytes = piexif.dump(exif_dict)
     return exif_bytes
@@ -543,7 +544,8 @@ def get_gps_data_ts (input_ts_file, device, tz, logger=logging):
     return locdata, packetno
 
 
-def build_gpxtree(locdata: dict, make: str, model: str) -> ET.ElementTree:
+def build_gpxtree(locdata: dict, make: str, model: str,
+                  generate_track=True) -> ET.ElementTree:
     gpx = ET.Element('gpx', version='1.0', creator='ts_processor')
     desc = ET.SubElement(gpx, 'desc')
     desc.text = f'Trace from {make} {model}'
@@ -552,8 +554,14 @@ def build_gpxtree(locdata: dict, make: str, model: str) -> ET.ElementTree:
     bounds = ET.SubElement(gpx, 'bounds')
     minlat, maxlat = 100, -100
     minlon, maxlon = 200, -200
-    track = ET.SubElement(gpx, 'trk')
-    trkseg = ET.SubElement(track, 'trkseg')
+
+    if generate_track:
+        track = ET.SubElement(gpx, 'trk')
+        container = ET.SubElement(track, 'trkseg')
+        point = 'trkpt'
+    else:
+        container = gpx
+        point = 'wpt'
 
     if isinstance(locdata, Mapping):
         iterator = locdata.items()
@@ -565,7 +573,8 @@ def build_gpxtree(locdata: dict, make: str, model: str) -> ET.ElementTree:
         minlat, maxlat = min(minlat, lat), max(maxlat, lat)
         minlon, maxlon = min(minlon, lon), max(maxlon, lon)
 
-        trkpt = ET.SubElement(trkseg, 'trkpt', lat=f"{lat:.6f}", lon=f"{lon:.6f}")
+        trkpt = ET.SubElement(container, point,
+                              lat=f"{lat:.6f}", lon=f"{lon:.6f}")
         ts = fix['ts']
         maxtime = max(maxtime, ts)
         time = ET.SubElement(trkpt, 'time')
@@ -576,6 +585,12 @@ def build_gpxtree(locdata: dict, make: str, model: str) -> ET.ElementTree:
             comment = ET.SubElement(trkpt, 'name')
             comment.text = photo
         # comment.text = f'track point {i}'
+
+        # if thumb := fix.get('thumbnail'):
+        #     encthumb = base64.b64encode(thumb).decode("us-ascii")
+        #     url = ET.SubElement(trkpt, 'url')
+        #     url.text = f'data:image/jpeg;base64,{encthumb}'
+            
         speed = ET.SubElement(trkpt, 'speed')
         speed.text = f"{fix['speed']:.1f}"
 
@@ -585,6 +600,58 @@ def build_gpxtree(locdata: dict, make: str, model: str) -> ET.ElementTree:
     bounds.set('maxlon', f"{maxlon:.6f}")
     metatime.text = maxtime.isoformat()
     return ET.ElementTree(gpx)
+
+
+def build_kml(locdata: dict, make: str, model: str):
+    kml = ET.Element('kml', xmlns='http://earth.google.com/kml/2.2')
+    doc = ET.SubElement(kml, 'Document')
+
+    if isinstance(locdata, Mapping):
+        iterator = locdata.items()
+    else:
+        iterator = enumerate(locdata)
+    
+    for i, fix in iterator:
+        lat, lon = fix['lat'], fix['lon']
+        icon_name = f'icon_{i}'
+
+        photo = ET.SubElement(doc, 'Placemark')
+        point = ET.SubElement(photo, 'Point')
+        coordinates = ET.SubElement(point, 'coordinates')
+        coordinates.text = f'{lon:.6f},{lat:.6f}'
+
+        # vv = ET.SubElement(photo, 'ViewVolume')
+        # ET.SubElement(vv, 'near').text = '1000'
+        # ET.SubElement(vv, 'leftFov').text = '-60'
+        # ET.SubElement(vv, 'rightFov').text = '60'
+        # ET.SubElement(vv, 'bottomFov').text = '-45'
+        # ET.SubElement(vv, 'topFov').text = '45'
+        
+        photofile = fix['photo']
+        if os.path.exists(photofile):
+            style = ET.SubElement(photo, 'Style', id=icon_name)
+            iconstyle = ET.SubElement(style, 'IconStyle')
+            icon = ET.SubElement(iconstyle, 'Icon')
+            href = ET.SubElement(icon, 'href')
+            href.text = os.path.basename(photofile)
+
+            ET.SubElement(iconstyle, 'scale').text = '3.0'
+            ET.SubElement(photo, 'styleUrl').text = '#'+icon_name
+            ET.SubElement(photo, 'name').text = photofile
+
+            # with open(photofile, 'rb') as fp:
+            #     with mmap.mmap(fp.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+            #         icon = ET.SubElement(photo, 'Icon')
+            #         href = ET.SubElement(icon, 'href')
+            #         href.text = f'data:image/jpeg;base64,'+base64.b64encode(mm).decode("us-ascii")
+        
+        # thumb = fix.get('thumbnail')
+        # if thumb:
+        #     enc = base64.b64encode(thumb).decode("us-ascii")
+        #     desc = ET.SubElement(photo, 'description')
+        #     desc.text = f'<img src="data:image/jpeg;base64,{enc}">'
+        
+    return ET.ElementTree(kml)
 
 
 def extrapolate_locdata(data1: dict, data2: dict) -> dict:
@@ -645,7 +712,7 @@ def interpolate_locdata(start: dict, end: dict, proportions: dict=None,
 
 
 def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
-                  mask=None, make='', model='',
+                  mask=None, make='', model='', kml_out=False,
                   device_override='', tz: float=0, crop=None,
                   sampling_interval: float=0.5, min_points=5,
                   min_speed=-1, timeshift: float=0, metric_distance: float=0,
@@ -871,7 +938,7 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
     lastframe = {}
     useframe = True
     next_distance = 0
-    thumbnail = None
+    raw_thumbnail = None
 
     photos = []
     while success and framecount < length and (not limit or count < limit):
@@ -987,14 +1054,18 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
 
             if thumbnails:
                 thumbnail = pil_image.copy()
-                thumbnail.thumbnail( (THUMB_WIDTH, THUMB_WIDTH) )
+                thumbnail.thumbnail( (THUMB_SIZE, THUMB_SIZE) )
+                o = io.BytesIO()
+                thumbnail.save(o, 'jpeg', quality=THUMB_QUALITY)
+                raw_thumbnail = o.getvalue()
+                # posinfo['thumbnail'] = raw_thumbnail
             
             exif_bytes = build_exif_data(
                 posinfo['lat'], posinfo['lon'],
                 bearing, make, model, datetime_taken,
                 speed=(posinfo['speed'] if use_speed else None),
                 width=width, height=height, exifdata=exifdata,
-                thumbnail=thumbnail)
+                thumbnail=raw_thumbnail)
 
             pil_image.save(jpgname, output_format, **PIL_SAVE_SETTINGS,
                            exif=exif_bytes)
@@ -1018,9 +1089,14 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
     logger.info('%s processed; %d image(s) extracted', input_ts_file, count)
 
     if gpx_out:
-        gpxtree = build_gpxtree(photos, make, model)
+        gpxtree = build_gpxtree(photos, make, model, generate_track=False)
         gpxtree.write(f'{fnbase}photos.gpx')
 
+    if kml_out:
+        kmltree = build_kml(photos, make, model)
+        kmltree.write(f'{fnbase}photos.kml')
+
+        
 def crap():
     #interpolate time and coordinates
     prev_dataframe = int((framecount+timeshift*fps)/fps)
@@ -1190,6 +1266,9 @@ def main():
                         help='use the specified configuration file')
     parser.add_argument('--thumbnails', action='store_true',
                         help='store thumbnails too')
+    parser.add_argument('--kml', action='store_true',
+                        help='produce a KML file showing photo locations')
+
     group = parser.add_mutually_exclusive_group()
     group.add_argument('--quiet', '-q', action='store_const', dest='loglevel',
                        const=logging.WARNING, default=logging.INFO,
@@ -1268,7 +1347,7 @@ def main():
                 max_aperature=args.max_aperature, limit=args.limit,
                 rotate=args.rotate, output_format=args.output_format,
                 focal_length=args.focal_length, thumbnails=args.thumbnails,
-                config=config)
+                kml_out=args.kml, config=config)
         return
 
     with concurrent.futures.ProcessPoolExecutor(max_workers=args.parallel) as executor:
@@ -1294,7 +1373,7 @@ def main():
                 max_aperature=args.max_aperature, limit=args.limit,
                 rotate=args.rotate, output_format=args.output_format,
                 focal_length=args.focal_length, thumbnails=args.thumbnails,
-                config=config)
+                kml_out=args.kml, config=config)
         
 
 if __name__ == '__main__':
