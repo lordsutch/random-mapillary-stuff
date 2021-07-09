@@ -3,6 +3,7 @@
 
 import argparse
 # import base64
+import cgitb
 import concurrent.futures
 import configparser
 import csv
@@ -18,9 +19,11 @@ import re
 import struct
 import sys
 from collections.abc import Mapping
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta, tzinfo
 from decimal import Decimal
 from fractions import Fraction
+from pathlib import Path
 from typing import Optional
 
 import cv2
@@ -34,6 +37,8 @@ try:
 except ImportError:
     import xml.etree.ElementTree as ET
 
+# Match filenames ending in mp4 or ts that don't start with a period
+VALID_FILENAME = re.compile(r'^(?!\.).*\.(mp4|ts)$', re.IGNORECASE)
 
 WGS84 = pyproj.Geod(ellps='WGS84')
 Mercator = pyproj.Proj(proj='webmerc', datum='WGS84')
@@ -46,8 +51,8 @@ DATETIME_STR_FORMAT = '%Y:%m:%d %H:%M:%S'
 THUMB_SIZE = 200
 THUMB_QUALITY = 60
 
-PIL_SAVE_SETTINGS = dict(quality=80,
-                         optimize=False,
+PIL_SAVE_SETTINGS = dict(quality=85,
+                         optimize=True,
                          progressive=True)
 
 EXTENSIONS = {'jpeg': 'jpg'}
@@ -57,6 +62,8 @@ JPEG_SETTINGS = (cv2.IMWRITE_JPEG_OPTIMIZE, 1,
                  cv2.IMWRITE_JPEG_QUALITY, 90,
                  # cv2.IMWRITE_JPEG_CHROMA_QUALITY, 80,
                  )
+
+logger = multiprocessing.log_to_stderr()
 
 # Define a context manager to suppress stdout and stderr.
 class suppress_stdout_stderr(object): #from here: https://stackoverflow.com/questions/11130156/suppress-stdout-stderr-print-from-python-functions
@@ -233,7 +240,7 @@ def set_gps_location(file_name, **args):
 
 def fix_coordinates(hemisphere: bytes, coordinate: float) -> float: #From here: https://sergei.nz/extracting-gps-data-from-viofo-a119-and-other-novatek-powered-cameras/
     # coordinate, = coordinate_input
-    degrees, minutes = divmod(coordinate, 100)
+    degrees, minutes = divmod(float(coordinate), 100)
     return (degrees + minutes/60) * (-1.0 if hemisphere in b'SW' else 1.0)
 
 
@@ -321,10 +328,15 @@ def detect_file_type(input_file, device_override='', logger=logging):
     make = "unknown"
     model = "unknown"
 
-    if input_file.lower().endswith(".ts"):
+    p = Path(input_file)
+    extension = p.suffix.lower()
+    known = extension in ('.ts', '.mp4') # Try everything if extension unknown
+    
+    if extension == '.ts' or not known:
         with open(input_file, "rb") as f:
             device = "A"
             with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                mm.madvise(mmap.MADV_SEQUENTIAL)
                 input_packet = mm.read(188)
                 if b"\xB0\x0D\x30\x34\xC3" in input_packet[4:20] or device_override == "V":
                     device = "V"
@@ -358,10 +370,11 @@ def detect_file_type(input_file, device_override='', logger=logging):
                         break
 
     ## This would probably be faster if mmap() is used
-    if input_file.lower().endswith(".mp4"):
+    if device == 'X' and extension == '.mp4' or not known:
         # Guess which MP4 method is used: Novatek, Subtitle, NMEA
         with open(input_file, "rb") as fx:
             with mmap.mmap(fx.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                mm.madvise(mmap.MADV_SEQUENTIAL)
                 eof = mm.size()
                 while mm.tell() < eof:
                     try:
@@ -424,6 +437,7 @@ def get_gps_data_nt (input_ts_file, device, tz, logger=logging):
     locdata = {}
     with open(input_ts_file, "rb") as f:
         with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+            mm.madvise(mmap.MADV_SEQUENTIAL)
             for match in re.finditer(b'freeGPS', mm):
                 input_packet = mm[match.start()+2:match.start()+188]
                 if currentdata := decode_novatek_gps_packet(
@@ -441,6 +455,7 @@ def get_gps_data_garmin (input_ts_file, device, tz):
     
     with open(input_ts_file, "rb") as f:
         with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+            mm.madvise(mmap.MADV_SEQUENTIAL)
             for match in re.finditer(b'\x00\x14\x50\x4E\x44\x4D\x00\x00\x00\x00', mm):
                 input_packet = mm[match.start():match.start()+56]
                 speed_kmh, lat, lon = garmin_gps_struct.unpack_from(input_packet)
@@ -463,19 +478,31 @@ def get_gps_data_garmin (input_ts_file, device, tz):
 def parse_nmea_rmc(line: bytes, tzone='Z') -> dict:
     bits = line.split(b',')
     datestr = f'{bits[9]} {bits[1]}{tzone}'
-    ts = datetime.strptime( datestr, '%d%m%y %H%M%S.%f%z')
+    ts = datetime.strptime(datestr, '%d%m%y %H%M%S.%f%z')
+
+    rawlat, lathem, rawlon, lonhem = bits[3:7]
+    lat = fix_coordinates(lathem, rawlat)
+    lon = fix_coordinates(lonhem, rawlon)
     mx, my = lonlat_metric(lon, lat)
+
     return dict(ts=ts, active=bits[2], lat=lat, latR=lathem, lon=lon,
                 lonR=lonhem, mx=mx, my=my, speed=float(bits[7])*KNOTS_TO_MPS,
                 bearing=float(bits[8]), metric=0, prevdist=0)
                                     
 
-def get_gps_data_nmea (input_file, device, tz):
+def get_gps_data_nmea(input_file, device, tz):
     packetno = 0
     locdata = {}
-     
+
+    offset = tz.utcoffset().total_seconds()
+    sign = '+' if offset >= 0 else '-'
+    minutes, seconds = divmod(abs(offset), 60)
+    hours, minutes = divmod(minutes, 60)
+    tzstr = f'{sign}{hours:02d}{minutes:02d}'
+    
     with open(input_file, "rb") as fx:
         with mmap.mmap(fx.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+            mm.madvise(mmap.MADV_SEQUENTIAL)
             eof = mm.size()
             prevts = datetime.fromtimestamp(0, timezone.utc)
             while mm.tell() < eof:
@@ -497,6 +524,8 @@ def get_gps_data_nmea (input_file, device, tz):
                             for line in lines.splitlines():
                                 if b"$GPRMC" in line:
                                     currentdata = parse_nmea_rmc(line, tzstr)
+                                    ts = currentdata['ts']
+                                    active = currentdata['active']
                                     if active == b'A' and ts > prevts:
                                         locdata[packetno] = currentdata
                                         prevts = ts
@@ -513,6 +542,7 @@ def get_gps_data_ts (input_ts_file, device, tz, logger=logging):
     # prevpacket = None
     with open(input_ts_file, "rb") as f:
         with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+            mm.madvise(mmap.MADV_SEQUENTIAL)
             input_packet = mm.read(188) #First packet, try to autodetect
 
             while True:
@@ -720,7 +750,7 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
                   bearing_modifier: float=0, use_speed=False, limit: int=0,
                   max_aperature=None, rotate: float=0, output_format='jpeg',
                   focal_length=None, min_coverage=90,
-                  csv_out=False, gpx_out=False) -> None:
+                  csv_out=False, gpx_out=False) -> int:
     logger = multiprocessing.get_logger()
     # logger = logging.getLogger('process_video.'+input_ts_file)
     logger.info('Processing %s', input_ts_file)
@@ -733,7 +763,7 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
     exifdata = {}
     modstr = f'{make} {model}'
 
-    video = cv2.VideoCapture(input_ts_file)
+    video = cv2.VideoCapture(str(input_ts_file))
     fps = video.get(cv2.CAP_PROP_FPS)
     length = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
     logger.debug('FPS: %d; LEN: %d', fps, length)
@@ -787,6 +817,11 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
     logger.debug("GPS data analysis ended; %d points", len(locdata))
     if packetno:
         logger.debug("Frames per point: %f", length/packetno)
+
+    if not locdata:
+        logger.warning('No GPS data found in %s', input_ts_file)
+        return 0
+        
     ###Logging
 
     fnbase, _ = os.path.splitext(os.path.join(folder, os.path.basename(input_ts_file)))
@@ -818,22 +853,6 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
                          distance)
             droplist.append(i+1)
             
-    # lasti = 0
-    # i = 1
-
-    # while i in locdata:
-    #     distance = WGS84.line_length(
-    #         lats=(locdata[i]['lat'], locdata[lasti]['lat']),
-    #         lons=(locdata[i]['lon'], locdata[lasti]['lon']))
-    #     # Probably garbage data if we've jumped > 10 km
-    #     if distance > 10000:
-    #         logger.debug('Dropping point %d %f meters away', i, distance)
-    #         droplist.append(i)
-    #     else:
-    #         # locdata[i]["prevdist"] = distance
-    #         lasti = i
-    #     i += 1
-
     for i in droplist:
         del locdata[i]
 
@@ -868,6 +887,8 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
 
             i += 1
 
+    assert locdata
+            
     i = min(locdata.keys())
     while i > -5:
         if not i in locdata:
@@ -944,7 +965,7 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
         # Interpolate time and coordinates
         current_time = locdata[0]['posix_clock'] + (framecount/fps)
 
-        prevts = (ts for ts in timestamps if ts <= current_time + timeshift)
+        prevts = [ts for ts in timestamps if ts <= current_time + timeshift]
         nextts = [ts for ts in timestamps if ts > current_time + timeshift]
 
         if not nextts:
@@ -1098,11 +1119,77 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
         kmltree = build_kml(photos, make, model)
         kmltree.write(f'{fnbase}photos.kml')
 
+    return count
+
+
+def process_video_with_exceptions(infile: os.PathLike, outfolder: os.PathLike,
+                                  *args, **kwargs) -> int:
+    try:
+        return process_video(infile, outfolder, *args, **kwargs)
+    except Exception:
+        tb = cgitb.text(sys.exc_info())
+        print(tb, file=sys.stderr)
+        raise
         
+
+def find_files(filelist: list, recursive=False) -> list:
+    inputfiles = []
+    for fname in filelist:
+        if '*' in fname or '?' in fname:
+            if not recursive:
+                # If they used '**', allow it even if not args.recursive
+                inputfiles += glob.iglob(fname, recursive=True)
+                continue
+
+            dirname, filepart = os.path.split(fname)
+            # If final part of the filename is a glob, glob the whole shebang
+            if '*' in filepart or '?' in filepart:
+                dirname, filepart = fname, ''
+
+            for d in glob.iglob(dirname):
+                path = Path(d) / filepart
+                if path.is_file():
+                    inputfiles.append(path)
+                elif path.is_dir() and not path.is_link():
+                    # Shell glob would have acted as below if --recursive on
+                    for root, dirs, files in os.walk(path):
+                        rootpath = Path(root)
+                        inputfiles += (
+                            rootpath / f for f in files
+                            if VALID_FILENAME.match(f))
+                elif path.is_link():
+                    logger.warning('not recursing into symlink %s', path)
+                else:
+                    logger.error('%s unsuitable, aborting', path)
+                    sys.exit(1)
+
+        # Must be a normal filename
+        p = Path(fname)
+        if p.is_file():
+            inputfiles.append(p)
+        elif p.is_dir():
+            if recursive:
+                for root, dirs, files in os.walk(p):
+                    rootpath = Path(root)
+                    inputfiles += (
+                        rootpath / f for f in files
+                        if VALID_FILENAME.match(str(f)))
+            else:
+                inputfiles += (f for f in p.iterdir()
+                               if VALID_FILENAME.match(str(f)))
+        else:
+            logger.error("Can't find input file: %s", fname)
+            sys.exit(1)
+            
+    return inputfiles
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('input', nargs='+', type=str,
                         help='input file or folder(s)')
+    parser.add_argument('--recursive', '-r', action='store_true',
+                        help='descend into subdirectories too')
     parser.add_argument('--sampling-interval', '--sampling_interval',
                         default=0.5, type=float,
                         help='distance between images in seconds')
@@ -1183,40 +1270,32 @@ def main():
     args = parser.parse_args()
     # print(args)
 
-    inputfiles = []
-    for fname in args.input:
-        if os.path.isfile(fname):
-            inputfiles.append(fname)
-        elif os.path.isdir(fname):
-            inputfiles.extend(f.path for f in os.scandir(fname) if f.name.lower().endswith('.ts') or f.name.lower().endswith('.mp4'))
-        elif '*' in fname or '?' in fname:
-            inputfiles.extend(glob.glob(fname))
-        else:
-            logger.error("Can't find input file: %s", fname)
-            sys.exit(1)
+    # logger = multiprocessing.log_to_stderr()
+    logger.setLevel(args.loglevel)
+
+    inputfiles = find_files(args.input, recursive=args.recursive)
 
     if not inputfiles:
         logger.error('No files to process.')
         sys.exit(1)
 
+    # print(inputfiles, len(inputfiles))
+    logger.debug('Found %d file(s) to process.', len(inputfiles))
+        
     configfiles = [args.configfile] if args.configfile else []
     
     if not configfiles:
         xdgconfdir = os.getenv('XDG_CONFIG_HOME', '~/.config')
         xdgconfdirs = os.getenv('XDG_CONFIG_DIRS', '/etc/xdg').split(':')
 
-        configfiles = [os.path.join(x, 'dashcam-photos.conf')
-                       for x in xdgconfdirs]
-        configfiles.append(os.path.join(xdgconfdir, 'dashcam-photos.conf'))
+        configfiles = [Path(x, 'dashcam-photos.conf') for x in xdgconfdirs]
+        configfiles.append(Path(xdgconfdir, 'dashcam-photos.conf'))
 
     config = configparser.ConfigParser()
     config.read(configfiles)
 
     use_sampling_interval = (not args.metric_distance)
     
-    logger = multiprocessing.log_to_stderr()
-    logger.setLevel(args.loglevel)
-
     if args.mask:
         mask = cv2.imread(args.mask, 0)
     else:
@@ -1252,31 +1331,37 @@ def main():
                 kml_out=args.kml, config=config)
         return
 
-    with concurrent.futures.ProcessPoolExecutor(max_workers=args.parallel) as executor:
-        for filename in inputfiles:
-            executor.submit(
-                process_video,
-                filename, args.folder,
-                mask=mask, make=args.make,
-                device_override=args.device_override,
-                model=args.model,
-                min_coverage=args.min_coverage,
-                min_points=args.min_points,
-                metric_distance=args.metric_distance,
-                turning_angle=args.turning_angle,
-                tz=args.timezone, csv_out=args.csv,
-                gpx_out=args.gpx, timeshift=args.timeshift,
-                bearing_modifier=args.bearing_modifier,
-                use_sampling_interval=use_sampling_interval,
-                crop=(args.crop_top, args.crop_bottom,
-                      args.crop_left, args.crop_right),
-                suppress_cv2_warnings=args.suppress_cv2_warnings,
-                use_speed=args.use_speed, sensor_width=args.sensor_width,
-                max_aperature=args.max_aperature, limit=args.limit,
-                rotate=args.rotate, output_format=args.output_format,
-                focal_length=args.focal_length, thumbnails=args.thumbnails,
-                kml_out=args.kml, config=config)
+    threads = []
+    with ProcessPoolExecutor(max_workers=args.parallel) as executor:
+        threads = [executor.submit(
+            process_video_with_exceptions,
+            filename, args.folder,
+            mask=mask, make=args.make,
+            device_override=args.device_override,
+            model=args.model,
+            min_coverage=args.min_coverage,
+            min_points=args.min_points,
+            metric_distance=args.metric_distance,
+            turning_angle=args.turning_angle,
+            tz=args.timezone, csv_out=args.csv,
+            gpx_out=args.gpx, timeshift=args.timeshift,
+            bearing_modifier=args.bearing_modifier,
+            use_sampling_interval=use_sampling_interval,
+            crop=(args.crop_top, args.crop_bottom,
+                  args.crop_left, args.crop_right),
+            suppress_cv2_warnings=args.suppress_cv2_warnings,
+            use_speed=args.use_speed, sensor_width=args.sensor_width,
+            max_aperature=args.max_aperature, limit=args.limit,
+            rotate=args.rotate, output_format=args.output_format,
+            focal_length=args.focal_length, thumbnails=args.thumbnails,
+            kml_out=args.kml, config=config)
+                   for filename in inputfiles]
         
+        for thread in threads:
+            thread.result()
+            if thread.exception():
+                return
+            
 
 if __name__ == '__main__':
     main()
