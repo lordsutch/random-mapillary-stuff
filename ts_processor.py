@@ -16,19 +16,24 @@ import logging
 import math
 import mmap
 import multiprocessing
+import operator
 import os
 import re
 import struct
 import sys
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta, tzinfo
 from decimal import Decimal
 from fractions import Fraction
 from pathlib import Path
 from typing import Optional
 
+import av
+import av.filter
 import cv2
+import imutils
 import piexif
 import pyproj
 from pymp4.parser import Box
@@ -326,10 +331,11 @@ def decode_novatek_gps_packet(packet: bytes, tz: tzinfo=timezone.utc,
     mx, my = lonlat_metric(lon, lat)
     ts = datetime(year=2000+year, month=month, day=day, hour=hour,
                   minute=minute, second=second, tzinfo=tz)
+    clock = ts.timestamp()
 
     return dict(lat=lat, latR=lathem, lon=lon, lonR=lonhem,
                 bearing=bearing, speed=speed, mx=mx, my=my,
-                metric=0, prevdist=0, ts=ts)
+                metric=0, prevdist=0, ts=ts, posix_clock=clock)
 
 
 def detect_file_type(input_file, device_override='', logger=logging):
@@ -461,7 +467,7 @@ def get_gps_data_nt(input_ts_file, device, tz, logger=logging, offsets=None):
     locdata = {}
     with open(input_ts_file, "rb") as f:
         with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-            mm.madvise(mmap.MADV_SEQUENTIAL)
+            mm.madvise(mmap.MADV_RANDOM)
             for (offset, length) in offsets:
                 input_packet = mm[offset:offset+length]
                 pos = input_packet.find(b'freeGPS')
@@ -477,10 +483,14 @@ def get_gps_data_nt(input_ts_file, device, tz, logger=logging, offsets=None):
                     packetno += 1
             if packetno > 0:
                 return locdata, packetno
-                
-            for match in re.finditer(b'freeGPS', mm[offset:]):
-                print('packet at', match.start())
-                input_packet = mm[match.start():match.start()+188]
+
+            # Slow scan
+            logger.debug('no GPS data found fast way; attempting full scan')
+            mm.madvise(mmap.MADV_SEQUENTIAL)
+            # If it's a real packet there should be a N or S followed by E or W
+            for match in re.finditer(b'(gps|freeGPS).{1,999}[NS][EW]', mm[0:]):
+                logger.debug('packet at %d-%d', match.start(), match.end())
+                input_packet = mm[match.start():match.end()+50]
                 if currentdata := decode_novatek_gps_packet(
                         input_packet, tz, logger):
                     locdata[packetno] = currentdata
@@ -507,6 +517,7 @@ def get_gps_data_garmin (input_ts_file, device, tz):
                 locdata[packetno] = dict(
                     speed=speed_kmh / 3.6,
                     bearing=0, ts=datetime.fromtimestamp(0, timezone.utc),
+                    posix_clock=0,
                     lat=lat, lon=lon, mx=mx, my=my,
                     latR=b'N' if lat >= 0 else b'S',
                     lonR=b'E' if lon >= 0 else b'W',
@@ -526,7 +537,8 @@ def parse_nmea_rmc(line: bytes, tzone='Z') -> dict:
     lon = fix_coordinates(lonhem, rawlon)
     mx, my = lonlat_metric(lon, lat)
 
-    return dict(ts=ts, active=bits[2], lat=lat, latR=lathem, lon=lon,
+    return dict(ts=ts, posix_clock=ts.timestamp,
+                active=bits[2], lat=lat, latR=lathem, lon=lon,
                 lonR=lonhem, mx=mx, my=my, speed=float(bits[7])*KNOTS_TO_MPS,
                 bearing=float(bits[8]), metric=0, prevdist=0)
                                     
@@ -732,16 +744,17 @@ def extrapolate_locdata(data1: dict, data2: dict) -> dict:
     if deltabearing > 180:
         deltabearing = deltabearing-360
 
+    tsdiff = data1["ts"]-(data2["ts"]-data1["ts"])
     return dict(
-        ts=data1["ts"]-(data2["ts"]-data1["ts"]),
+        ts=tsdiff, posix_clock=tsdiff.timestamp,
         mx=mx, my=my, lat=lat, lon=lon,
         bearing=(data1["bearing"]-deltabearing) % 360,
         speed=data1["speed"]-(data2["speed"]-data1["speed"]),
         metric=0, prevdist=0)
 
 
-def interpolate_locdata(start: dict, end: dict, proportions: dict=None,
-                        position: float=None) -> dict:
+def interpolate_locdata(start: dict, end: dict, proportions: dict = None,
+                        position: float = None) -> dict:
     deltamx = end["mx"]-start["mx"]
     deltamy = end["my"]-start["my"]
     deltats = end["ts"]-start["ts"]
@@ -769,9 +782,10 @@ def interpolate_locdata(start: dict, end: dict, proportions: dict=None,
         
         # if abs(deltabearing) > 2:
         #     print('here', curpos, deltabearing, curpos*deltabearing, bearing)
-                
+
+        ts = start["ts"] + deltats*curpos
         locdata[i] = dict(
-            ts=start["ts"] + deltats*curpos,
+            ts=ts, posix_clock=ts.timestamp(),
             mx=mx, my=my, lat=lat, lon=lon,
             speed=start["speed"] + deltaspeed*curpos,
             bearing=bearing, metric=metric, prevdist=prevdist)
@@ -781,83 +795,15 @@ def interpolate_locdata(start: dict, end: dict, proportions: dict=None,
     return locdata
 
 
-def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
-                  mask=None, make='', model='', kml_out=False,
-                  device_override='', tz: float=0,
-                  crop_left=0, crop_right=0, crop_top=0, crop_bottom=0,
-                  sampling_interval: float=0.5, min_points=5,
-                  min_speed=-1, timeshift: float=0, metric_distance: float=0,
-                  turning_angle: float=0, suppress_cv2_warnings=False,
-                  use_sampling_interval=True, config=None, sensor_width=None,
-                  bearing_modifier: float=0, use_speed=False, limit: int=0,
-                  max_aperature=None, rotate: float=0, output_format='jpeg',
-                  focal_length=None, min_coverage=90,
-                  keep_aspect_ratio=False,
-                  csv_out=False, gpx_out=False, dry_run=False) -> int:
-    logger = multiprocessing.get_logger()
-    # logger = logging.getLogger('process_video.'+input_ts_file)
-    logger.info('Processing %s', input_ts_file)
+def extract_gps(input_ts_file: os.PathLike, tzone, logger,
+                make, model, device_override, length):
+    '''Extract the GPS data from the specified input file.'''
     device, detected_make, detected_model, offsets = detect_file_type(
         input_ts_file, device_override, logger)
     logger.debug('Detected %s %s %s', detected_make, detected_model, device)
     make = make or detected_make
     model = model or detected_model
-
-    do_crop = any((crop_left, crop_top, crop_right, crop_bottom))
-
-    vidcontext = (suppress_stdout_stderr if suppress_cv2_warnings else 
-                  contextlib.nullcontext)
-
-    rot_radians = math.radians(rotate)
-    exifdata = {}
-    modstr = f'{make} {model}'
-
-    video = cv2.VideoCapture(str(input_ts_file))
-    fps = video.get(cv2.CAP_PROP_FPS)
-    length = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
-    logger.debug('FPS: %d; LEN: %d', fps, length)
-
-    if not config:
-        config = configparser.ConfigParser()
     
-    make = config.get(modstr, 'make', fallback=make)
-    model = config.get(modstr, 'model', fallback=model)
-
-    max_aperature = config.get(modstr, 'max_aperature',
-                               fallback=max_aperature)
-    if max_aperature:
-        # Convert to APEX - # of stops from f/1
-        apex_max_aperature = math.log(max_aperature**2, 2)
-        # F numbers are rounded to 2 SF, so reverse the rounding
-        # and store precisely
-        apex_max_aperature = Fraction(round(apex_max_aperature)*6, 6)
-        exifdata['max aperature'] = apex_max_aperature
-
-    sensor_width = config.get(modstr, 'sensor_width',
-                              fallback=sensor_width)
-    if sensor_width:
-        width = int(video.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(video.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-        pixel_width = sensor_width/width/10
-        exifdata['focal plane x resolution'] = pixel_width
-        exifdata['focal plane y resolution'] = pixel_width
-
-    focal_length = config.get(modstr, 'focal_length', fallback=focal_length)
-    if focal_length:
-        exifdata['focal length'] = focal_length
-
-    if sensor_width and focal_length:
-        crop_factor = 35/sensor_width
-        exifdata['35mm equivalent focal length'] = focal_length*crop_factor
-            
-    interval = int(sampling_interval*fps)
-    if interval == 0:
-        interval = 1
-    locdata = {}
-    packetno = 0
-
-    tzone = timezone(timedelta(hours=tz))
     if device in "BVS":
         locdata, packetno = get_gps_data_ts(input_ts_file, device, tzone, logger)
     elif device in "T":
@@ -872,29 +818,12 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
     if packetno:
         logger.debug("Frames per point: %f", length/packetno)
 
-    if not locdata:
-        logger.warning('No GPS data found in %s', input_ts_file)
-        return 0
-        
-    ###Logging
+    return locdata, packetno
 
-    if not os.path.exists(folder) and not dry_run:
-        os.makedirs(folder)
     
-    fnbase, _ = os.path.splitext(os.path.join(folder, os.path.basename(input_ts_file)))
-    fnbase += '_'
-    if csv_out:
-        with open(f'{fnbase}pre_interp.csv', 'w', newline='') as fd:
-            csvfile = csv.DictWriter(fd, fieldnames=locdata[0],
-                                     delimiter=';')
-            csvfile.writeheader()
-            csvfile.writerows(locdata.values())
-
-    if gpx_out:
-        gpxtree = build_gpxtree(locdata, make, model)
-        gpxtree.write(f'{fnbase}pre_interp.gpx')
-    ###
-
+def clean_gps_data(locdata, length, fps, min_coverage):
+    '''Interpolate, extrapolate, and remove garbage GPS data.'''
+    
     # Remove any insane coordinate values
     droplist = []
 
@@ -915,42 +844,55 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
 
     # Need at least 2 points to interpolate
     if len(locdata) < 2:
-        logger.info('Not enough GPS data for interpolation; need >= 2 points, got %d', len(locdata))
-    elif len(locdata)<min_coverage*length*0.01/fps:
-        logger.info("Not enough GPS data for interpolation; %d%% needed, %f%% found", min_coverage, 100*len(locdata)/length*fps)
-    elif len(locdata)<length/fps:
-        logger.info("Interpolating missing points")
-        i = 0
-        while i < length/fps:
-            if i not in locdata:
-                #Find previous existing
-                prev_data = i - 1
-                while prev_data not in locdata and prev_data > 0:
-                    prev_data -= 1
+        logger.info(
+            'Not enough GPS data for interpolation; need >= 2 points, got %d',
+            len(locdata))
+    elif len(locdata) < min_coverage*length*0.01/fps:
+        logger.info(
+            "Not enough GPS data for interpolation; %d%% needed, %f%% found",
+            min_coverage, 100*len(locdata)/length*fps)
+    elif len(locdata) < length/fps:
+        logger.info("Interpolating missing points: want %.1f have %d",
+                    length/fps, len(locdata))
 
-                next_data = i + 1
-                #Find next existing
-                while next_data not in locdata and next_data < length/fps:
-                    next_data += 1
+        locdata_ts = {}
+        for gps_loc in locdata.values():
+            locdata_ts[gps_loc['posix_clock']] = gps_loc
 
-                if prev_data in locdata and next_data in locdata:
-                    gap = next_data - prev_data
+        startclock = min(locdata_ts)
+        for i in range(int(length/fps)):
+            clock = startclock + i
+            if clock not in locdata_ts:
+                # Find previous existing
+                prev_pos = i - 1
+                while prev_pos not in locdata and prev_pos > 0:
+                    prev_pos -= 1
 
-                    props = {counter : (counter - prev_data)/gap
-                             for counter in range(i, next_data)}
-                    locdata.update(interpolate_locdata(
-                        prev_data, next_data, props))
-                    i = next_data
+                next_pos = i + 1
+                # Find next existing
+                while next_pos not in locdata and next_pos < length/fps:
+                    next_pos += 1
 
-            i += 1
+                if prev_pos in locdata and next_pos in locdata:
+                    gap = next_pos - prev_pos
 
-    assert locdata
+                    props = {counter: (counter - prev_pos)/gap
+                             for counter in range(i, next_pos)}
 
+                    newdata = interpolate_locdata(locdata[prev_pos],
+                                                  locdata[next_pos], props)
+                    
+                    for posinfo in newdata.values():
+                        locdata_ts[posinfo['posix_clock']] = posinfo
+
+        locdata = {i: posinfo for i, posinfo in enumerate(
+            sorted(locdata_ts.values(),
+                   key=operator.itemgetter('posix_clock')))}
+                        
     if len(locdata) >= 2:
         for i in range(min(locdata), -5, -1):
             if i not in locdata:
                 locdata[i] = extrapolate_locdata(locdata[i+1], locdata[i+2])
-
         for i in range(max(locdata)+1, int(1.1 * length / fps)):
             if i not in locdata:
                 locdata[i] = extrapolate_locdata(locdata[i-1], locdata[i-2])
@@ -972,12 +914,266 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
     #         lons=(locdata[i]['lon'], locdata[i-1]['lon']))
     #     locdata[i]["prevdist"] = distance
     #     locdata[i]["metric"] = locdata[i-1]["metric"] + distance
+    return locdata
+
+
+# Code so I can easily switch video and image processing backends
+class VideoWrapper:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, exc_traceback):
+        self.close()
+
+
+class OpenCVVideoWrapper(VideoWrapper):
+    def __init__(self, path: os.PathLike, maskfile: os.PathLike = '',
+                 rotate: float = 0, keep_aspect_ratio: bool = False,
+                 crop_top: int = 0, crop_left: int = 0,
+                 crop_bottom: int = 0, crop_right: int = 0):
+        self.video = cv2.VideoCapture(str(path))
+        self.fps = self.video.get(cv2.CAP_PROP_FPS)
+        self.length = int(self.video.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.mask = cv2.imread(maskfile, 0) if maskfile else None
+        self.width = int(self.video.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.height = int(self.video.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self.rotate = rotate
+        self.keep_aspect_ratio = keep_aspect_ratio
+        self.crop_top, self.crop_bottom = crop_top, crop_bottom
+        self.crop_left, self.crop_right = crop_left, crop_right
+        
+    def __del__(self):
+        if self.video.isOpened():
+            self.video.release()
+            
+    def __iter__(self):
+        success, framedata = self.video.read()
+        while success:
+            if self.mask:
+                cv2.bitwise_and(framedata, framedata, mask=self.mask)
+                
+            if self.rotate:
+                orig_height, orig_width = framedata.shape[:2]
+                framedata = imutils.rotate_bound(framedata, -self.rotate)
+                height, width = framedata.shape[:2]
+                nw, nh = rotatedRectWithMaxArea(
+                    orig_width, orig_height, math.radians(-self.rotate))
+                
+                if self.keep_aspect_ratio:
+                    orig_ratio = orig_width / orig_height
+                    new_ratio = nw / nh
+                    if new_ratio > orig_ratio:
+                        nw = nh*orig_ratio
+                    else:
+                        nh = nw/orig_ratio
+
+                x1 = int((width - nw)/2)
+                y1 = int((height - nh)/2)
+
+                x2 = int(x1 + nw)+1
+                y2 = int(y1 + nh)+1
+
+                framedata = framedata[y1:y2, x1:x2]
+            
+            if self.crop_left or self.crop_right or \
+                 self.crop_bottom or self.crop_top:
+                h, w = framedata.shape[:2]
+                framedata = framedata[self.crop_top:h-self.crop_bottom,
+                                      self.crop_left:w-self.crop_right]
+            
+            yield Image.fromarray(
+                cv2.cvtColor(framedata, cv2.COLOR_BGR2RGB))
+            success, framedata = self.video.read()
+        
+    def seek_frame(self, frame):
+        self.video.set(1, frame)
+
+    def close(self):
+        self.video.release()
+
+
+class AVVideoWrapper(VideoWrapper):
+    def __init__(self, path: os.PathLike, maskfile: os.PathLike = '',
+                 rotate: float = 0, keep_aspect_ratio: bool = False,
+                 crop_top: int = 0, crop_left: int = 0,
+                 crop_bottom: int = 0, crop_right: int = 0):
+        self.container = av.open(str(path))
+        self.vidstream = self.container.streams.video[0]
+        self.fps = 1 / self.vidstream.time_base
+        self.length = self.vidstream.duration
+        self.wantedframe = 0
+
+        self.mask = Image.open(maskfile) if maskfile else None
+        
+        # Set up image filter graph
+        self.graph = av.filter.Graph()
+        tail = self.graph.add_buffer(template=self.vidstream)
+        if rotate:
+            angle = f'{-rotate}*PI/180'
+            rotate_filter = self.graph.add(
+                'rotate', f'{angle}:ow=rotw({angle}):oh=roth({angle})')
+            tail.link_to(rotate_filter)
+            tail = rotate_filter
+            nw, nh = rotatedRectWithMaxArea(
+                self.vidstream.width, self.vidstream.height,
+                math.radians(-rotate))
+            if keep_aspect_ratio:
+                orig_ratio = self.vidstream.width / self.vidstream.height
+                new_ratio = nw / nh
+                if new_ratio > orig_ratio:
+                    nw = nh*orig_ratio
+                else:
+                    nh = nw/orig_ratio
+
+            # ffmpeg's default is to center the crop, which is what we want
+            crop_filter = self.graph.add('crop', f'w={int(nw)},h={int(nh)}')
+            tail.link_to(crop_filter)
+            tail = crop_filter
+
+        if crop_left or crop_right or crop_top or crop_bottom:
+            crop_filter = self.graph.add(
+                'crop', f'w=iw-{int(crop_right+crop_left)},'
+                f'h=ih-{int(crop_bottom+crop_top)},'
+                f'x={crop_left},y={crop_top}')
+            tail.link_to(crop_filter)
+            tail = crop_filter
+
+        sink = self.graph.add('buffersink')
+        tail.link_to(sink)
+        self.graph.configure()
+                
+    def __del__(self):
+        self.close()
+        
+    def __iter__(self):
+        framedata = self.vidstream.decode()
+        if framedata:
+            # May need to move forward to assemble the right frame
+            for frame in framedata:
+                if frame.pts >= self.wantedframe:
+                    if self.mask:
+                        img = frame.to_image()
+                        img = Image.composite(img, img, self.mask)
+                        frame = av.video.frame.VideoFrame.from_image(img)
+                        
+                    self.graph.push(frame)
+                    filtered_frame = self.graph.pull()
+                    yield filtered_frame.to_image()
+        
+    def seek_frame(self, frame):
+        self.container.seek(frame)
+        # Seek isn't exact, will go to most recent keyframe
+        self.wanted_frame = frame
+        # self.video.set(1, frame)
+
+    def close(self):
+        self.container.close()
+        self.container = None
+
+
+def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
+                  maskfile: str = '', make='', model='', kml_out=False,
+                  device_override='', tz: float=0,
+                  crop_left=0, crop_right=0, crop_top=0, crop_bottom=0,
+                  sampling_interval: float=0.5, min_points=5,
+                  min_speed=-1, timeshift: float=0, metric_distance: float=0,
+                  turning_angle: float=0, suppress_cv2_warnings=False,
+                  use_sampling_interval=True, config=None, sensor_width=None,
+                  bearing_modifier: float=0, use_speed=False, limit: int=0,
+                  max_aperature=None, rotate: float=0, output_format='jpeg',
+                  focal_length=None, min_coverage=90,
+                  keep_aspect_ratio=False,
+                  csv_out=False, gpx_out=False, dry_run=False) -> int:
+    logger = multiprocessing.get_logger()
+    # logger = logging.getLogger('process_video.'+input_ts_file)
+    logger.info('Processing %s', input_ts_file)
+
+    vidcontext = (suppress_stdout_stderr if suppress_cv2_warnings else 
+                  contextlib.nullcontext)
+    exifdata = {}
+    modstr = f'{make} {model}'
+
+    with vidcontext():
+        video = OpenCVVideoWrapper(input_ts_file, maskfile, rotate,
+                                   keep_aspect_ratio,
+                                   crop_top, crop_left,
+                                   crop_bottom, crop_right)
+        video_iterator = iter(video)
+    
+    fps, length = video.fps, video.length
+    logger.debug('FPS: %d; LEN: %d', fps, length)
+
+    if not config:
+        config = configparser.ConfigParser()
+    
+    make = config.get(modstr, 'make', fallback=make)
+    model = config.get(modstr, 'model', fallback=model)
+
+    max_aperature = config.get(modstr, 'max_aperature',
+                               fallback=max_aperature)
+    if max_aperature:
+        # Convert to APEX - # of stops from f/1
+        apex_max_aperature = math.log(max_aperature**2, 2)
+        # F numbers are rounded to 2 SF, so reverse the rounding
+        # and store precisely
+        apex_max_aperature = Fraction(round(apex_max_aperature)*6, 6)
+        exifdata['max aperature'] = apex_max_aperature
+
+    sensor_width = config.get(modstr, 'sensor_width',
+                              fallback=sensor_width)
+    if sensor_width:
+        width, height = video.width, video.height
+        pixel_width = sensor_width/width/10
+        exifdata['focal plane x resolution'] = pixel_width
+        exifdata['focal plane y resolution'] = pixel_width
+
+    focal_length = config.get(modstr, 'focal_length', fallback=focal_length)
+    if focal_length:
+        exifdata['focal length'] = focal_length
+
+    if sensor_width and focal_length:
+        crop_factor = 35/sensor_width
+        exifdata['35mm equivalent focal length'] = focal_length*crop_factor
+            
+    interval = int(sampling_interval*fps)
+    if interval == 0:
+        interval = 1
+    locdata = {}
+    packetno = 0
+
+    tzone = timezone(timedelta(hours=tz))
+    locdata, packetno = extract_gps(input_ts_file, tzone, logger,
+                                    make, model, device_override, length)
+
+    if not locdata:
+        logger.warning('No GPS data found in %s', input_ts_file)
+        return 0
+    
+    ### Logging
+
+    if not os.path.exists(folder) and not dry_run:
+        os.makedirs(folder)
+
+    vidext = EXTENSIONS.get(output_format.lower(), output_format.lower())
+    fnbase = Path(folder) / (Path(input_ts_file).stem + '_')
+    
+    if csv_out and not dry_run:
+        with open(f'{fnbase}pre_interp.csv', 'w', newline='') as fd:
+            csvfile = csv.DictWriter(fd, fieldnames=locdata[0],
+                                     delimiter=';')
+            csvfile.writeheader()
+            csvfile.writerows(locdata.values())
+
+    if gpx_out and not dry_run:
+        gpxtree = build_gpxtree(locdata, make, model)
+        gpxtree.write(f'{fnbase}pre_interp.gpx')
+    ###
+
+    locdata = clean_gps_data(locdata, length, fps, min_coverage)
 
     locdata_ts = {}
-    for i, gps_loc in locdata.items():
-        # print(i, gps_loc)
-        clock = gps_loc['posix_clock'] = gps_loc['ts'].timestamp()
-        locdata_ts[clock] = gps_loc
+    for gps_loc in locdata.values():
+        locdata_ts[gps_loc['posix_clock']] = gps_loc
         
     ###Logging
     if csv_out and not dry_run:
@@ -996,7 +1192,7 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
     if len(locdata) < min_points:
         logger.warning("Not enough GPS data for frame extraction: %s",
                        input_ts_file)
-        return
+        return 0
 
     if dry_run:
         logger.info("Would be extracting from %s now", input_ts_file)
@@ -1005,7 +1201,11 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
 
     framecount = 0
     count = 0
-    success, image = video.read()
+
+    with vidcontext():
+        pil_image = next(video_iterator)
+        success = bool(pil_image)
+    
     turning = False
 
     # current_time = locdata[0]['ts']
@@ -1045,8 +1245,8 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
         # logger.debug(lastframe)
         # logger.debug(posinfo)
         
-        if (use_sampling_interval and not lastframe or
-            current_time-lastframe.get('posix_clock', 0) > sampling_interval):
+        if use_sampling_interval and not lastframe or \
+           current_time-lastframe.get('posix_clock', 0) > sampling_interval:
             useframe = True
             
         if metric_distance and not turning_angle:
@@ -1094,71 +1294,30 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
         
         if useframe:
             with vidcontext():
-                video.set(1, framecount)
-                success, image = video.read()
+                video.seek_frame(framecount)
+                pil_image = next(video_iterator)
+                success = bool(pil_image)
             
             if not success:
                 break
 
-            if mask:
-                image = cv2.bitwise_and(image, image, mask=mask)
-
-            pil_image = Image.fromarray(
-                cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
-
-            width, height = pil_image.size
-            if abs(rotate) % 90 == 0:
-                pil_image = pil_image.rotate(rotate)
-                width, height = pil_image.size
-            elif rotate:
-                orig_width, orig_height = width, height
-                pil_image = pil_image.rotate(rotate, Image.BICUBIC,
-                                             expand=True)
-                width, height = pil_image.size
-                nw, nh = rotatedRectWithMaxArea(width, height, rot_radians)
-
-                if keep_aspect_ratio:
-                    orig_ratio = orig_width / orig_height
-                    new_ratio = nw / nh
-                    if new_ratio > orig_ratio:
-                        nw = nh*orig_ratio
-                    else:
-                        nh = nw/orig_ratio
-                
-                x1 = (width - nw)//2 + crop_left
-                y1 = (height - nh)//2 + crop_top
-                
-                x2 = x1 + nw - crop_right
-                y2 = y1 + nh - crop_bottom
-
-                pil_image = pil_image.crop((x1, y1, x2, y2))
-                width, height = pil_image.size
-            elif do_crop:
-                pil_image = pil_image.crop(
-                    (crop_left, crop_top, width - crop_right,
-                     height - crop_bottom))
-                width, height = pil_image.size
-
             datetime_taken = posinfo['ts']
-            # datetime_taken = datetime.fromtimestamp(new_ts + tz*3600)
 
-            ext = EXTENSIONS.get(output_format.lower(), output_format.lower())
-            
-            jpgname = f'{fnbase}{count:06d}.{ext}'
+            jpgname = f'{fnbase}{count:06d}.{vidext}'
             logger.debug('Would save %s' if dry_run else 'Saving %s', jpgname)
-
-            # cv2.imwrite(jpgname, image, JPEG_SETTINGS)
 
             bearing = (posinfo['bearing'] + bearing_modifier) % 360
 
-            if thumbnails:
+            if thumbnails and output_format == 'jpeg':
                 thumbnail = pil_image.copy()
                 thumbnail.thumbnail((THUMB_SIZE, THUMB_SIZE))
                 o = io.BytesIO()
                 thumbnail.save(o, 'jpeg', quality=THUMB_QUALITY)
                 raw_thumbnail = o.getvalue()
                 # posinfo['thumbnail'] = raw_thumbnail
-            
+
+            width, height = pil_image.size
+                
             exif_bytes = build_exif_data(
                 posinfo['lat'], posinfo['lon'],
                 bearing, make, model, datetime_taken,
@@ -1184,11 +1343,12 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
             framecount += 1
             useframe = False
         
-    video.release()
+    video.close()
+
     if dry_run:
         logger.info('%s processed; would have extracted %d image(s)',
                     input_ts_file, count)
-        return 0
+        return True
 
     logger.info('%s processed; %d image(s) extracted', input_ts_file, count)
 
@@ -1384,12 +1544,10 @@ def main():
 
     use_sampling_interval = (not args.metric_distance)
 
-    mask = cv2.imread(args.maskfile, 0) if args.maskfile else None
-
     if args.dry_run:
         logger.warning('*** Dry run - no data saved ***')
 
-    kwargs = {'config': config, 'mask': mask,
+    kwargs = {'config': config,
               'use_sampling_interval': use_sampling_interval}
 
     # Hacky but meh... maybe I should just pass args around
@@ -1397,25 +1555,35 @@ def main():
     argdict = vars(args)
     kwargs |= {arg: argdict[arg] for arg in sig.parameters if arg in argdict}
     if set(sig.parameters) - set(kwargs) != {'input_ts_file'}:
-        log.error('Missing arguments:', set(sig.parameters)-set(kwargs))
+        logger.error('Missing arguments:', set(sig.parameters)-set(kwargs))
         return
 
+    frames_saved = {}
     if args.parallel == 1:
         cgitb.enable(format='text')
         for filename in inputfiles:
-            process_video(filename, **kwargs)
+            frames_saved[filename] = process_video(filename, **kwargs)
+
+        missing = [fname for fname, count in frames_saved.items() if not count]
+        if missing:
+            logger.warning('Files with no frames saved:\n'+
+                           os.linesep.join(str(x) for x in missing))
         return
 
-    threads = []
-    with ProcessPoolExecutor(max_workers=args.parallel) as executor:
-        threads = [executor.submit(process_video_with_exceptions,
-                                   filename, **kwargs)
-                   for filename in inputfiles]
+    with ThreadPoolExecutor(max_workers=args.parallel) as executor:
+        threads = {filename: executor.submit(process_video_with_exceptions,
+                                             filename, **kwargs)
+                   for filename in inputfiles}
         
-        for thread in threads:
-            thread.result()
-            if thread.exception():
-                return
+        for filename, future in threads.items():
+            frames_saved[filename] = future.result()
+            if future.exception():
+                break
+        
+        missing = [fname for fname, count in frames_saved.items() if not count]
+        if missing:
+            logger.warning('Files with no frames saved:\n'+
+                           os.linesep.join(str(x) for x in missing))
             
 
 if __name__ == '__main__':
