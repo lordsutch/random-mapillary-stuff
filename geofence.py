@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 
 import argparse
+import datetime
 import math
 import os
+import re
 import shlex
 import sys
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+# from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 from pathlib import Path
 
+import astral
+import astral.sun
 import exif
 import pyproj
 import shapely.geometry
@@ -15,6 +19,7 @@ import shapely.ops
 from progress.bar import Bar
 
 WGS84 = pyproj.CRS('epsg:4326')
+DTRE = re.compile(r'(\d{4}):(\d{2}):(\d{2})')
 
 
 # convert_wgs_to_utm function, see https://stackoverflow.com/a/40140326/4556479
@@ -79,7 +84,7 @@ def parse_geofence_spec(spec: str, infile: Path) -> Geofence:
                 ((lon1, lat1), (lon2, lat1), (lon2, lat2), (lon1, lat2))))
         elif token == 'poly':
             shape = []
-            while (latstr := lexer.get_token() != 'endpoly'):
+            while (latstr := lexer.get_token()) != 'endpoly':
                 lat, lon = float(latstr), float(lexer.get_token)
                 shape.append((lat, lon))
             if len(shape) < 3:
@@ -94,9 +99,35 @@ def parse_geofence_spec(spec: str, infile: Path) -> Geofence:
     return fence
 
 
+def geofence_image(fence: Geofence, lat: float, lon: float,
+                   imgtime: datetime.DateTime = None,
+                   filter_dark=True) -> bool:
+    '''Returns True if we should keep the image, False otherwise.'''
+    filtered = False
+    if filter_dark:
+        date = imgtime.date()
+        loc = astral.Observer(latitude=lat, longitude=lon)
+        try:
+            sunrise, sunset = astral.sun.daylight(loc, date=date)
+            # print(dt, sunrise, sunset)
+            if imgtime < sunrise or imgtime > sunset:
+                filtered = True
+        except ValueError:
+            noon = astral.sun.noon(loc, date=date)
+            if astral.sun.elevation(noon) < 0:
+                # Sun is not up at noon, so it's winter
+                filtered = True
+    
+    position = shapely.geometry.Point(lon, lat)
+
+    return (not filtered and position not in fence)
+
+
 def geofence_file(imgfile: os.PathLike, fence: Geofence,
                   save_as: os.PathLike = None,
-                  move_to=None, strip_gps=False):
+                  move_to: os.PathLike = None,
+                  filter_dark=True,
+                  strip_gps=False):
     with open(imgfile, 'rb') as imfp:
         my_image = exif.Image(imfp)
 
@@ -113,12 +144,15 @@ def geofence_file(imgfile: os.PathLike, fence: Geofence,
     if not latref or not lonref:
         return
 
-    position = shapely.geometry.Point(dms_to_decimal(lon, lonref),
-                                      dms_to_decimal(lat, latref))
+    dlon, dlat = dms_to_decimal(lon, lonref), dms_to_decimal(lat, latref)
 
-    if position not in fence:
+    dto = my_image.get('datetime_original', '')
+    imgtime = datetime.datetime.strptime(dto, '%Y:%m:%d %H:%M:%S').replace(
+        tzinfo=datetime.timezone.utc)
+    
+    if not geofence_image(fence, dlat, dlon, imgtime, filter_dark):
         return
-
+    
     if strip_gps:
         for tag in my_image.list_all():
             if tag.startswith('gps_'):
@@ -133,13 +167,16 @@ def geofence_file(imgfile: os.PathLike, fence: Geofence,
 
         if move_to:
             imgfile.unlink()
+        return outpath
     elif move_to:
         new_filename = Path(move_to) / (save_as or imgfile).name
         imgfile.rename(new_filename)
-
+        return new_filename
+    
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='handle images within geographic boundaries differently')
+    parser = argparse.ArgumentParser(
+        description='handle images within geographic boundaries differently')
     parser.add_argument('--strip-gps', action='store_true',
                         help='remove geotagging from matching files')
     parser.add_argument('--move', type=str, metavar='DIR',
@@ -148,7 +185,10 @@ if __name__ == '__main__':
                         help='descend into subdirectories too')
     parser.add_argument('--fence', action='store', type=Path,
                         default=Path('geofence-spec'),
-                        help='file to read geofences from')    
+                        help='file to read geofences from')
+    parser.add_argument('--keep-night-photos', action='store_true',
+                        help="don't filter out photos taken before "
+                        "sunrise/after sunset")
     parser.add_argument('files', type=Path, nargs='+', metavar='FILE|DIR',
                         help='files and/or directories to process')
     args = parser.parse_args()
@@ -177,5 +217,13 @@ if __name__ == '__main__':
             print(f'No fence information found in {args.fence}, aborting.')
             sys.exit(1)
 
+    filtered = []
     for path in Bar('Geofencing').iter(to_process):
-        geofence_file(path, fence, move_to=args.move, strip_gps=args.strip_gps)
+        filtered_file = geofence_file(path, fence, move_to=args.move,
+                                      strip_gps=args.strip_gps,
+                                      filter_dark=not args.keep_night_photos)
+        if filtered_file:
+            filtered.append(filtered_file)
+            
+    if len(filtered):
+        print(f'Filtered {len(filtered)} files.')
