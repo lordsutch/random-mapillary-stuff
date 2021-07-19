@@ -4,7 +4,6 @@ import argparse
 import datetime
 import math
 import os
-import re
 import shlex
 import sys
 # from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
@@ -19,7 +18,6 @@ import shapely.ops
 from progress.bar import Bar
 
 WGS84 = pyproj.CRS('epsg:4326')
-DTRE = re.compile(r'(\d{4}):(\d{2}):(\d{2})')
 
 
 # convert_wgs_to_utm function, see https://stackoverflow.com/a/40140326/4556479
