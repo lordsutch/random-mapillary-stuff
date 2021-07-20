@@ -7,6 +7,7 @@ import os
 import shlex
 import sys
 # from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+from functools import cache
 from pathlib import Path
 
 import astral
@@ -98,7 +99,7 @@ def parse_geofence_spec(spec: str, infile: Path) -> Geofence:
 
 
 def geofence_image(fence: Geofence, lat: float, lon: float,
-                   imgtime: datetime.DateTime = None,
+                   imgtime: datetime.datetime = None,
                    filter_dark=True) -> bool:
     '''Returns True if we should keep the image, False otherwise.'''
     filtered = False
