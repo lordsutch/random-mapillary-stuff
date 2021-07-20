@@ -829,7 +829,7 @@ def extract_gps(input_ts_file: os.PathLike, tzone, logger,
     return locdata, packetno
 
     
-def clean_gps_data(locdata, length, fps, min_coverage):
+def clean_gps_data(locdata, length, fps, min_coverage, timeshift=0):
     '''Interpolate, extrapolate, and remove garbage GPS data.'''
     
     # Remove any insane coordinate values
@@ -841,7 +841,8 @@ def clean_gps_data(locdata, length, fps, min_coverage):
     for i in droplist:
         del locdata[i]
 
-    if len(locdata) >= 2:
+    fixcount = len(locdata)
+    if fixcount >= 2:
         keylist = sorted(locdata)
         lats = [locdata[j]['lat'] for j in keylist]
         lons = [locdata[j]['lon'] for j in keylist]
@@ -900,9 +901,12 @@ def clean_gps_data(locdata, length, fps, min_coverage):
         locdata = {i: posinfo for i, posinfo in enumerate(
             sorted(locdata_ts.values(),
                    key=operator.itemgetter('posix_clock')))}
-                        
+
     if len(locdata) >= 2:
-        for i in range(min(locdata), -5, -1):
+        time_per_fix = (locdata[max(locdata)]['posix_clock'] - locdata[min(locdata)]['posix_clock'])/len(locdata)
+        extend = int(math.ceil(abs(timeshift)/time_per_fix))
+        
+        for i in range(min(locdata), min(locdata)-extend, -1):
             if i not in locdata:
                 locdata[i] = extrapolate_locdata(locdata[i+1], locdata[i+2])
         for i in range(max(locdata)+1, int(1.1 * length / fps)):
@@ -910,15 +914,15 @@ def clean_gps_data(locdata, length, fps, min_coverage):
                 locdata[i] = extrapolate_locdata(locdata[i-1], locdata[i-2])
 
         keylist = sorted(locdata)
-        lats = [locdata[j]['lat'] for j in keylist if j >= 0]
-        lons = [locdata[j]['lon'] for j in keylist if j >= 0]
+        lats = [locdata[j]['lat'] for j in keylist]
+        lons = [locdata[j]['lon'] for j in keylist]
         distances = WGS84.line_lengths(lats=lats, lons=lons)
 
         for i, prev_distance in enumerate(distances):
-            locdata[i+1]['prevdist'] = prev_distance
+            locdata[keylist[i+1]]['prevdist'] = prev_distance
 
         for i, cum_distance in enumerate(itertools.accumulate(distances)):
-            locdata[i+1]['metric'] = cum_distance
+            locdata[keylist[i+1]]['metric'] = cum_distance
         
     # for i in range(1, max(locdata):
     #     distance = WGS84.line_length(
@@ -1190,7 +1194,7 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
     
     if csv_out and not dry_run:
         with open(f'{fnbase}pre_interp.csv', 'w', newline='') as fd:
-            csvfile = csv.DictWriter(fd, fieldnames=locdata[0],
+            csvfile = csv.DictWriter(fd, fieldnames=locdata[min(locdata)],
                                      delimiter=';')
             csvfile.writeheader()
             csvfile.writerows(locdata.values())
@@ -1200,12 +1204,12 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
         gpxtree.write(f'{fnbase}pre_interp.gpx')
     ###
 
-    locdata = clean_gps_data(locdata, length, fps, min_coverage)
+    locdata = clean_gps_data(locdata, length, fps, min_coverage, timeshift)
 
     ###Logging
     if csv_out and not dry_run:
         with open(f'{fnbase}post_interp.csv', 'w', newline='') as fd:
-            csvfile = csv.DictWriter(fd, fieldnames=locdata[0],
+            csvfile = csv.DictWriter(fd, fieldnames=locdata[min(locdata)],
                                      delimiter=';')
             csvfile.writeheader()
             csvfile.writerows(locdata.values())
@@ -1229,10 +1233,6 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
     framecount = 0
     count = 0
 
-    with vidcontext():
-        pil_image = next(video_iterator)
-        success = bool(pil_image)
-    
     turning = False
 
     # current_time = locdata[0]['ts']
@@ -1243,14 +1243,15 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
         locdata_ts[gps_loc['posix_clock']] = gps_loc
     timestamps = sorted(locdata_ts)
     lastframe = {}
-    useframe = True
+    useframe = False
     next_distance = 0
     raw_thumbnail = None
 
-    start_dt = guess_start_time(input_ts_file, locdata[0]['ts'], tz)
+    start_dt = guess_start_time(input_ts_file, locdata[min(locdata)]['ts'], tz)
     start_time = start_dt.timestamp()
     
     photos = []
+    success = True
     while success and framecount < length and (not limit or count < limit):
         # Interpolate time and coordinates
         current_time = start_time + (framecount/fps)
@@ -1261,7 +1262,6 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
             continue
         
         nextts = [ts for ts in timestamps if ts > current_time + timeshift]
-
         if not nextts:
             break
         
@@ -1274,17 +1274,18 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
         currentpos = (current_time+timeshift-prev_fix)/(next_fix-prev_fix)
         posinfo = interpolate_locdata(locprev, locnext, position=currentpos)
 
-        if framecount % 60 == 0:
-            logger.debug('fr %d ts %.3f target %.3fm at %.3fm',
-                         framecount, current_time, next_distance,
-                         posinfo['metric'])
+        if framecount % fps == 0:
+            logger.debug('fr %d ts %.1f [%.1f %.1f] target %.2fm at %.2fm',
+                         framecount, current_time, current_time-prev_fix,
+                         current_time-next_fix,
+                         next_distance, posinfo['metric'])
         # logger.debug('%.3f %.3f', next_distance, posinfo['metric'])
         # logger.debug(currentpos)
         # logger.debug(lastframe)
         # logger.debug(posinfo)
         
-        if use_sampling_interval and not lastframe or \
-           current_time-lastframe.get('posix_clock', 0) > sampling_interval:
+        if use_sampling_interval and (not lastframe or \
+           current_time-lastframe.get('posix_clock', 0) > sampling_interval):
             useframe = True
             
         if metric_distance and not turning_angle:
@@ -1342,7 +1343,8 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
             datetime_taken = posinfo['ts']
 
             jpgname = f'{fnbase}{count:06d}.{vidext}'
-            logger.debug('Would save %s' if dry_run else 'Saving %s', jpgname)
+            logger.debug('Would save fr %d: %s' if dry_run
+                         else 'Saving fr %d: %s', framecount, jpgname)
 
             bearing = (posinfo['bearing'] + bearing_modifier) % 360
 
