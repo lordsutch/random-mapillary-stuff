@@ -84,7 +84,7 @@ def parse_geofence_spec(spec: str, infile: Path) -> Geofence:
         elif token == 'poly':
             shape = []
             while (latstr := lexer.get_token()) != 'endpoly':
-                lat, lon = float(latstr), float(lexer.get_token)
+                lat, lon = float(latstr), float(lexer.get_token())
                 shape.append((lat, lon))
             if len(shape) < 3:
                 print(f'Polygon should have >= 3 sides, got {len(shape)}.',
