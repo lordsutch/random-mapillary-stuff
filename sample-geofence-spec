@@ -1,0 +1,17 @@
+# Geofence around a point
+# point: lat lon distance (m)
+
+# ex: Geofence 25 m radius of Elizabeth Tower (Big Ben)
+point 51.5006895 -0.1245838 25
+
+# Geofence a rectangular area by bounds (any 2 corners OK).
+# bbox: lat1 lon1 lat2 lon2
+
+# ex: Geofence the grounds of the Taj Mahal
+bbox 27.17553 78.04050 27.17043 78.04371
+
+# Geofence a polygon (>= 3 sides) by vertices
+# poly: lat1 lon1 lat2 lon2 ... latN lonN endpoly
+
+# ex: geofence perimeter of Busch Stadium in St. Louis
+poly 38.62201 -90.19463 38.62134 -90.19196 38.62302 -90.19123 38.62384 -90.19376 endpoly
