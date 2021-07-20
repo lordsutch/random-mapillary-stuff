@@ -119,7 +119,7 @@ def geofence_image(fence: Geofence, lat: float, lon: float,
     
     position = shapely.geometry.Point(lon, lat)
 
-    return (not filtered and position not in fence)
+    return (filtered or position in fence)
 
 
 def geofence_file(imgfile: os.PathLike, fence: Geofence,
