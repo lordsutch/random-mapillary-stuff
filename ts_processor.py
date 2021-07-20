@@ -22,9 +22,9 @@ import re
 import struct
 import sys
 from collections.abc import Mapping
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from contextlib import contextmanager
-from datetime import datetime, timezone, timedelta, tzinfo
+from datetime import datetime, timedelta, timezone, tzinfo
 from decimal import Decimal
 from fractions import Fraction
 from pathlib import Path
@@ -36,8 +36,8 @@ import cv2
 import imutils
 import piexif
 import pyproj
-from pymp4.parser import Box
 from PIL import Image
+from pymp4.parser import Box
 
 try:
     from lxml import etree as ET
@@ -293,9 +293,9 @@ def metric_lonlat(xmx, ymy):
 def decode_novatek_gps_packet(packet: bytes, tz: tzinfo=timezone.utc,
                               logger=logging) -> Optional[dict]:
     # Different units and firmware seem to put the data in different places
-    if m := re.search(rb'[NS][EW]', packet):
+    if m := re.search(rb'[ AV][0NS][0EW]', packet):
         offset = m.start()
-        input_packet = packet[offset-25:]
+        input_packet = packet[offset-24:]
     else:
         logger.debug('Unknown packet: %s', packet[:188])
         logger.debug(packet[:188].hex(' ', 8))
@@ -306,20 +306,18 @@ def decode_novatek_gps_packet(packet: bytes, tz: tzinfo=timezone.utc,
      active, lathem, lonhem, enclat, enclon, speed_knots,
      bearing) = unpacked
 
-    if active != b'A':
-        logger.debug('Not active.')
-        logger.debug(unpacked)
-        return None
-
-    # Decode Novatek coordinate format to decimal degrees
-    lat = fix_coordinates(lathem, enclat)
-    lon = fix_coordinates(lonhem, enclon)
+    if active == b'A':
+        # Decode Novatek coordinate format to decimal degrees
+        lat = fix_coordinates(lathem, enclat)
+        lon = fix_coordinates(lonhem, enclon)
+        mx, my = lonlat_metric(lon, lat)
+    else:
+        lat = lon = mx = my = None
 
     # Validity checks
     if (not (0 <= hour <= 23) or not (0 <= minute <= 59) or
         not (0 <= second <= 60) or not (1 <= month <= 12) or
-        not (1 <= day <= 31) or not (-180 <= lon <= 180) or
-        not (-90 <= lat <= 90) or not (0 <= bearing <= 360) or
+        not (1 <= day <= 31) or not (0 <= bearing <= 360) or
         speed_knots < 0):
         # Packet is invalid
         logger.debug('Packet invalid: %s', packet)
@@ -328,13 +326,12 @@ def decode_novatek_gps_packet(packet: bytes, tz: tzinfo=timezone.utc,
         return None
 
     speed = speed_knots * KNOTS_TO_MPS
-    mx, my = lonlat_metric(lon, lat)
     ts = datetime(year=2000+year, month=month, day=day, hour=hour,
                   minute=minute, second=second, tzinfo=tz)
     clock = ts.timestamp()
 
     return dict(lat=lat, latR=lathem, lon=lon, lonR=lonhem,
-                bearing=bearing, speed=speed, mx=mx, my=my,
+                bearing=bearing, speed=speed, mx=mx, my=my, active=active,
                 metric=0, prevdist=0, ts=ts, posix_clock=clock)
 
 
@@ -488,7 +485,8 @@ def get_gps_data_nt(input_ts_file, device, tz, logger=logging, offsets=None):
             logger.debug('no GPS data found fast way; attempting full scan')
             mm.madvise(mmap.MADV_SEQUENTIAL)
             # If it's a real packet there should be a N or S followed by E or W
-            for match in re.finditer(b'(gps|freeGPS).{1,999}[NS][EW]', mm[0:]):
+            for match in re.finditer(
+                    b'(freeGPS).{1,999}[0NS][0EW]', mm[0:]):
                 logger.debug('packet at %d-%d', match.start(), match.end())
                 input_packet = mm[match.start():match.end()+50]
                 if currentdata := decode_novatek_gps_packet(
@@ -510,14 +508,17 @@ def get_gps_data_garmin (input_ts_file, device, tz):
             for match in re.finditer(b'\x00\x14\x50\x4E\x44\x4D\x00\x00\x00\x00', mm):
                 input_packet = mm[match.start():match.start()+56]
                 speed_kmh, lat, lon = garmin_gps_struct.unpack_from(input_packet)
-                lat /= 11930464.711111112
-                lon /= 11930464.711111112
-                mx, my = lonlat_metric(lon, lat)
+                if lat and lon:
+                    lat /= 11930464.711111112
+                    lon /= 11930464.711111112
+                    mx, my = lonlat_metric(lon, lat)
+                else:
+                    lat = lon = mx = my = None
                 
                 locdata[packetno] = dict(
                     speed=speed_kmh / 3.6,
                     bearing=0, ts=datetime.fromtimestamp(0, timezone.utc),
-                    posix_clock=0,
+                    posix_clock=0, active=b'A',
                     lat=lat, lon=lon, mx=mx, my=my,
                     latR=b'N' if lat >= 0 else b'S',
                     lonR=b'E' if lon >= 0 else b'W',
@@ -529,15 +530,19 @@ def get_gps_data_garmin (input_ts_file, device, tz):
 
 def parse_nmea_rmc(line: bytes, tzone='Z') -> dict:
     bits = line.split(b',')
-    datestr = f'{bits[9]} {bits[1]}{tzone}'
+    datestr = f'{bits[9].decode("us-ascii")} {bits[1].decode("us-ascii")}{tzone}'
     ts = datetime.strptime(datestr, '%d%m%y %H%M%S.%f%z')
 
     rawlat, lathem, rawlon, lonhem = bits[3:7]
-    lat = fix_coordinates(lathem, rawlat)
-    lon = fix_coordinates(lonhem, rawlon)
-    mx, my = lonlat_metric(lon, lat)
+    lat = fix_coordinates(lathem, rawlat) if rawlat else None
+    lon = fix_coordinates(lonhem, rawlon) if rawlon else None
 
-    return dict(ts=ts, posix_clock=ts.timestamp,
+    if rawlat and rawlon:
+        mx, my = lonlat_metric(lon, lat)
+    else:
+        mx = my = None
+
+    return dict(ts=ts, posix_clock=ts.timestamp(),
                 active=bits[2], lat=lat, latR=lathem, lon=lon,
                 lonR=lonhem, mx=mx, my=my, speed=float(bits[7])*KNOTS_TO_MPS,
                 bearing=float(bits[8]), metric=0, prevdist=0)
@@ -579,7 +584,7 @@ def get_gps_data_nmea(input_file, device, tz):
                                     currentdata = parse_nmea_rmc(line, tzstr)
                                     ts = currentdata['ts']
                                     active = currentdata['active']
-                                    if active == b'A' and ts > prevts:
+                                    if ts > prevts:
                                         locdata[packetno] = currentdata
                                         prevts = ts
                                         packetno += 1
@@ -651,6 +656,9 @@ def build_gpxtree(locdata: dict, make: str, model: str,
         iterator = enumerate(locdata)
     
     for i, fix in iterator:
+        if fix['active'] not in b'AIX':
+            continue
+        
         lat, lon = fix['lat'], fix['lon']
         minlat, maxlat = min(minlat, lat), max(maxlat, lat)
         minlon, maxlon = min(minlon, lon), max(maxlon, lon)
@@ -746,10 +754,10 @@ def extrapolate_locdata(data1: dict, data2: dict) -> dict:
 
     tsdiff = data1["ts"]-(data2["ts"]-data1["ts"])
     return dict(
-        ts=tsdiff, posix_clock=tsdiff.timestamp,
-        mx=mx, my=my, lat=lat, lon=lon,
+        ts=tsdiff, posix_clock=tsdiff.timestamp(),
+        mx=mx, my=my, lat=lat, lon=lon, active=b'X',
         bearing=(data1["bearing"]-deltabearing) % 360,
-        speed=data1["speed"]-(data2["speed"]-data1["speed"]),
+        speed=max(data1["speed"]-(data2["speed"]-data1["speed"]), 0),
         metric=0, prevdist=0)
 
 
@@ -786,8 +794,8 @@ def interpolate_locdata(start: dict, end: dict, proportions: dict = None,
         ts = start["ts"] + deltats*curpos
         locdata[i] = dict(
             ts=ts, posix_clock=ts.timestamp(),
-            mx=mx, my=my, lat=lat, lon=lon,
-            speed=start["speed"] + deltaspeed*curpos,
+            mx=mx, my=my, lat=lat, lon=lon, active=b'I',
+            speed=max(start["speed"] + deltaspeed*curpos, 0),
             bearing=bearing, metric=metric, prevdist=prevdist)
 
     if position is not None:
@@ -826,21 +834,25 @@ def clean_gps_data(locdata, length, fps, min_coverage):
     
     # Remove any insane coordinate values
     droplist = []
+    for i, fix in locdata.items():
+        if fix['active'] != b'A':
+            droplist.append(i)
 
-    keylist = sorted(locdata)
-    lats = [locdata[j]['lat'] for j in keylist]
-    lons = [locdata[j]['lon'] for j in keylist]
-    distances = WGS84.line_lengths(lats=lats, lons=lons)
-
-    for i, prev_distance in enumerate(distances):
-        # Probably garbage data if we've jumped > 10 km
-        if prev_distance > 10000:
-            logger.debug('Dropping (bogus?) point %d %.1f meters away', i,
-                         prev_distance)
-            droplist.append(i+1)
-            
     for i in droplist:
         del locdata[i]
+
+    if len(locdata) >= 2:
+        keylist = sorted(locdata)
+        lats = [locdata[j]['lat'] for j in keylist]
+        lons = [locdata[j]['lon'] for j in keylist]
+        distances = WGS84.line_lengths(lats=lats, lons=lons)
+
+        for i, prev_distance in enumerate(distances):
+            # Probably garbage data if we've jumped > 10 km
+            if prev_distance > 10000:
+                logger.debug('Dropping (bogus?) point %d %.1f meters away', i,
+                             prev_distance)
+                del locdata[i+1]
 
     # Need at least 2 points to interpolate
     if len(locdata) < 2:
@@ -1071,6 +1083,21 @@ class AVVideoWrapper(VideoWrapper):
         self.container = None
 
 
+FNPARSER = re.compile('(\d{4})_?(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})')
+
+def guess_start_time(path: os.PathLike, first_fix_time: datetime,
+                     tz: float=0) -> datetime:
+    path = Path(path)
+    if match:= FNPARSER.match(path.stem):
+        year, month, day, h, m, s = (int(x) for x in match.groups())
+        ts = datetime(year, month, day, h, m, s,
+                      tzinfo=timezone(timedelta(hours=tz)))
+        if first_fix_time != ts:
+            logger.debug('guessed %s log starts at %s', ts, first_fix_time)
+        return ts
+    return first_fix_time
+    
+
 def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
                   maskfile: str = '', make='', model='', kml_out=False,
                   device_override='', tz: float=0,
@@ -1103,6 +1130,10 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
     fps, length = video.fps, video.length
     logger.debug('FPS: %d; LEN: %d', fps, length)
 
+    if not video.length:
+        logger.warning('%s is empty', input_ts_file)
+        return 0
+    
     if not config:
         config = configparser.ConfigParser()
     
@@ -1171,10 +1202,6 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
 
     locdata = clean_gps_data(locdata, length, fps, min_coverage)
 
-    locdata_ts = {}
-    for gps_loc in locdata.values():
-        locdata_ts[gps_loc['posix_clock']] = gps_loc
-        
     ###Logging
     if csv_out and not dry_run:
         with open(f'{fnbase}post_interp.csv', 'w', newline='') as fd:
@@ -1210,18 +1237,29 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
 
     # current_time = locdata[0]['ts']
     # framelength = 1/fps
+    
+    locdata_ts = {}
+    for gps_loc in locdata.values():
+        locdata_ts[gps_loc['posix_clock']] = gps_loc
     timestamps = sorted(locdata_ts)
     lastframe = {}
     useframe = True
     next_distance = 0
     raw_thumbnail = None
 
+    start_dt = guess_start_time(input_ts_file, locdata[0]['ts'], tz)
+    start_time = start_dt.timestamp()
+    
     photos = []
     while success and framecount < length and (not limit or count < limit):
         # Interpolate time and coordinates
-        current_time = locdata[0]['posix_clock'] + (framecount/fps)
+        current_time = start_time + (framecount/fps)
 
         prevts = [ts for ts in timestamps if ts <= current_time + timeshift]
+        if not prevts:
+            framecount += 1
+            continue
+        
         nextts = [ts for ts in timestamps if ts > current_time + timeshift]
 
         if not nextts:
