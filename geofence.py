@@ -103,12 +103,14 @@ def geofence_image(fence: Geofence, lat: float, lon: float,
                    filter_dark=True) -> bool:
     '''Returns True if we should keep the image, False otherwise.'''
     filtered = False
+    tz = datetime.timezone(datetime.timedelta(hours=lon // 15))
+    
     if filter_dark:
-        date = imgtime.date()
+        date = imgtime.astimezone(tz).date()
         loc = astral.Observer(latitude=lat, longitude=lon)
         try:
-            sunrise, sunset = astral.sun.daylight(loc, date=date)
-            # print(dt, sunrise, sunset)
+            sunrise, sunset = astral.sun.daylight(loc, date, tz)
+            # print(date, imgtime, sunrise, sunset)
             if imgtime < sunrise or imgtime > sunset:
                 filtered = True
         except ValueError:
