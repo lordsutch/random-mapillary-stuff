@@ -103,7 +103,7 @@ def geofence_image(fence: Geofence, lat: float, lon: float,
                    filter_dark=True) -> bool:
     '''Returns True if we should keep the image, False otherwise.'''
     filtered = False
-    tz = datetime.timezone(datetime.timedelta(hours=lon // 15))
+    tz = datetime.timezone(datetime.timedelta(hours=(lon+7.5) // 15))
     
     if filter_dark:
         date = imgtime.astimezone(tz).date()
