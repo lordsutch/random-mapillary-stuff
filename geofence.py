@@ -218,6 +218,9 @@ if __name__ == '__main__':
             print(f'No fence information found in {args.fence}, aborting.')
             sys.exit(1)
 
+    if not Path(args.move).is_dir():
+        os.makedirs(args.move)
+            
     filtered = []
     for path in Bar('Geofencing').iter(to_process):
         filtered_file = geofence_file(path, fence, move_to=args.move,
