@@ -98,27 +98,28 @@ def parse_geofence_spec(spec: str, infile: Path) -> Geofence:
     return fence
 
 
+def image_is_dark(lat: float, lon: float, imgtime: datetime.datetime = None) -> bool:
+    tz = datetime.timezone(datetime.timedelta(hours=(lon+7.5) // 15))
+    date = imgtime.astimezone(tz).date()
+    loc = astral.Observer(latitude=lat, longitude=lon)
+    try:
+        sunrise, sunset = astral.sun.daylight(loc, date, tz)
+        # print(date, imgtime, sunrise, sunset)
+        if imgtime < sunrise or imgtime > sunset:
+            return True
+    except ValueError:
+        noon = astral.sun.noon(loc, date=date)
+        if astral.sun.elevation(noon) < 0:
+            # Sun is not up at noon, so it's winter
+            return True
+    return False
+
+
 def geofence_image(fence: Geofence, lat: float, lon: float,
                    imgtime: datetime.datetime = None,
                    filter_dark=True) -> bool:
     '''Returns True if we should keep the image, False otherwise.'''
-    filtered = False
-    tz = datetime.timezone(datetime.timedelta(hours=(lon+7.5) // 15))
-    
-    if filter_dark:
-        date = imgtime.astimezone(tz).date()
-        loc = astral.Observer(latitude=lat, longitude=lon)
-        try:
-            sunrise, sunset = astral.sun.daylight(loc, date, tz)
-            # print(date, imgtime, sunrise, sunset)
-            if imgtime < sunrise or imgtime > sunset:
-                filtered = True
-        except ValueError:
-            noon = astral.sun.noon(loc, date=date)
-            if astral.sun.elevation(noon) < 0:
-                # Sun is not up at noon, so it's winter
-                filtered = True
-    
+    filtered = image_is_dark(lat, lon, imgtime) if filter_dark else False
     position = shapely.geometry.Point(lon, lat)
 
     return (filtered or position in fence)
