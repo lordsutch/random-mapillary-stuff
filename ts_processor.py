@@ -21,6 +21,7 @@ import os
 import re
 import struct
 import sys
+import webbrowser
 from collections.abc import Mapping
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from contextlib import contextmanager
@@ -38,6 +39,8 @@ import piexif
 import pyproj
 from PIL import Image
 from pymp4.parser import Box
+
+import geofence
 
 try:
     from lxml import etree as ET
@@ -318,11 +321,15 @@ def decode_novatek_gps_packet(packet: bytes, tz: tzinfo=timezone.utc,
     if (not (0 <= hour <= 23) or not (0 <= minute <= 59) or
         not (0 <= second <= 60) or not (1 <= month <= 12) or
         not (1 <= day <= 31) or not (0 <= bearing <= 360) or
-        speed_knots < 0):
+        speed_knots < 0 or active not in b'AV'):
         # Packet is invalid
         logger.debug('Packet invalid: %s', packet)
         logger.debug(packet.hex(' '))
         logger.debug(unpacked)
+        return None
+
+    if active != b'A':
+        logger.debug('No GPS fix: %s', unpacked)
         return None
 
     speed = speed_knots * KNOTS_TO_MPS
@@ -1097,10 +1104,49 @@ def guess_start_time(path: os.PathLike, first_fix_time: datetime,
         ts = datetime(year, month, day, h, m, s,
                       tzinfo=timezone(timedelta(hours=tz)))
         if first_fix_time != ts:
-            logger.debug('guessed %s log starts at %s', ts, first_fix_time)
+            logger.info('guessed %s log starts at %s', ts, first_fix_time)
         return ts
     return first_fix_time
+
+
+def galleryview_path(frame):
+    return f'frame{frame:06d}.html'
+
+
+def create_galleryview(video, frame, posinfo, basedir, prevframe,
+                       nextframe, lastframe):
+    import folium
     
+    video.seek_frame(frame)
+    vidframe = next(iter(video))
+    imgpath = f'img{frame:06d}.jpg'
+    vidframe.save(Path(basedir) / imgpath)
+
+    coords = (posinfo['lat'], posinfo['lon'])
+    folium_map = folium.Map(location=coords, zoom_start=18)
+    folium.Marker(coords, popup=f'frame {frame}').add_to(folium_map)
+    map_html = folium_map._repr_html_()
+
+    navbar = ''
+    if prevframe is not None:
+        navbar += f'<a href="{galleryview_path(0)}">&lt;&lt;</a> <a href="{galleryview_path(prevframe)}">&lt;</a> '
+    else:
+        navbar += f'<a href="{galleryview_path(0)}">&lt;&lt;</a> &lt; '
+        
+    if nextframe is not None:
+        navbar += f'<a href="{galleryview_path(nextframe)}">&gt;</a> <a href="{galleryview_path(lastframe)}">&gt;&gt;</a> '
+    else:
+        navbar += f'&gt; <a href="{galleryview_path(lastframe)}">&gt;&gt;</a> '
+
+    navbar += f'{basedir} Frame: {frame:06d} {coords[0]:.6f} {coords[1]:.6f} Timestamp: {posinfo["ts"]} '
+
+    pct = 60
+    livepage = f'<html><body><div>{navbar}</div><div style="width: {pct}%; float:left;"><img src="{imgpath}" style="width: 100%; height: auto"></div><div style="width: {100-pct}%;float: right;">{map_html}</div></body></html>'
+    fname = galleryview_path(frame)
+    with open(Path(basedir) / fname, 'w') as fp:
+        fp.write(livepage)
+    return fname
+
 
 def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
                   maskfile: str = '', make='', model='', kml_out=False,
@@ -1113,7 +1159,8 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
                   bearing_modifier: float=0, use_speed=False, limit: int=0,
                   max_aperature=None, rotate: float=0, output_format='jpeg',
                   focal_length=None, min_coverage=90,
-                  keep_aspect_ratio=False,
+                  keep_aspect_ratio=False, gallery=False,
+                  keep_night_photos=False, geofence_spec=None,
                   csv_out=False, gpx_out=False, dry_run=False) -> int:
     logger = multiprocessing.get_logger()
     # logger = logging.getLogger('process_video.'+input_ts_file)
@@ -1183,7 +1230,19 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
     if not locdata:
         logger.warning('No GPS data found in %s', input_ts_file)
         return 0
+
+    first_time = locdata[min(locdata)]['ts']
+    last_time = locdata[max(locdata)]['ts']
+    gpscount = len(locdata)
+    gpslen = (last_time - first_time).seconds
     
+    # vidlen = length/fps
+
+    # if not math.isclose(gpslen, vidlen, rel_tol=5):
+    #     logger.warning('%s: Video is %.2f sec, GPS track is %.2f sec',
+    #                    input_ts_file, vidlen, gpslen)
+    #     return 0
+
     ### Logging
 
     if not os.path.exists(folder) and not dry_run:
@@ -1191,6 +1250,11 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
 
     vidext = EXTENSIONS.get(output_format.lower(), output_format.lower())
     fnbase = Path(folder) / (Path(input_ts_file).stem + '_')
+
+    if gallery:
+        gallerydir = Path(folder) / ('gal-'+(Path(input_ts_file).stem))
+        if not os.path.exists(gallerydir):
+            os.makedirs(gallerydir)
     
     if csv_out and not dry_run:
         with open(f'{fnbase}pre_interp.csv', 'w', newline='') as fd:
@@ -1247,21 +1311,29 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
     next_distance = 0
     raw_thumbnail = None
 
-    start_dt = guess_start_time(input_ts_file, locdata[min(locdata)]['ts'], tz)
+    # This doesn't seem to be very accurate
+    # start_dt = guess_start_time(input_ts_file, locdata[min(locdata)]['ts'], tz)
+    # start_dt = locdata[min(locdata)]['ts']
+    logger.debug('f: %s l: %s c: %d', first_time, last_time, gpscount)
+    start_dt = min(first_time, last_time-timedelta(seconds=(length/fps)-1))
+    logger.debug('%s: guessed first frame at %s', input_ts_file, start_dt)
+    
     start_time = start_dt.timestamp()
     
     photos = []
     success = True
+    browser = False
     while success and framecount < length and (not limit or count < limit):
         # Interpolate time and coordinates
         current_time = start_time + (framecount/fps)
+        shifted_time = current_time + timeshift
 
-        prevts = [ts for ts in timestamps if ts <= current_time + timeshift]
+        prevts = [ts for ts in timestamps if ts <= shifted_time]
         if not prevts:
             framecount += 1
             continue
         
-        nextts = [ts for ts in timestamps if ts > current_time + timeshift]
+        nextts = [ts for ts in timestamps if ts > shifted_time]
         if not nextts:
             break
         
@@ -1271,21 +1343,40 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
         locprev = locdata_ts[prev_fix]
         locnext = locdata_ts[next_fix]
         
-        currentpos = (current_time+timeshift-prev_fix)/(next_fix-prev_fix)
+        currentpos = (shifted_time-prev_fix)/(next_fix-prev_fix)
         posinfo = interpolate_locdata(locprev, locnext, position=currentpos)
 
+        if not keep_night_photos and geofence.image_is_dark(posinfo['lat'], posinfo['lon'], posinfo['ts']):
+            logger.debug('skipping frame %d: dark', framecount)
+            framecount += 1
+            continue
+
+        if geofence_spec and geofence.geofence_image(geofence_spec, posinfo['lat'], posinfo['lon'], posinfo['ts'], False):
+            logger.debug('skipping frame %d: fenced', framecount)
+            framecount += 1
+            continue
+        
         if framecount % fps == 0:
             logger.debug('fr %d ts %.1f [%.1f %.1f] target %.2fm at %.2fm',
-                         framecount, current_time, current_time-prev_fix,
-                         current_time-next_fix,
+                         framecount, shifted_time, shifted_time-prev_fix,
+                         shifted_time-next_fix,
                          next_distance, posinfo['metric'])
         # logger.debug('%.3f %.3f', next_distance, posinfo['metric'])
         # logger.debug(currentpos)
         # logger.debug(lastframe)
         # logger.debug(posinfo)
+
+        if gallery:
+            fpath = create_galleryview(
+                video, framecount, posinfo, gallerydir,
+                framecount-1 if framecount > 0 else None,
+                framecount+1 if framecount < length-1 else None,
+                length-1)
+            if not browser:
+                webbrowser.open(str(fpath))
+                browser = True
         
-        if use_sampling_interval and (not lastframe or \
-           current_time-lastframe.get('posix_clock', 0) > sampling_interval):
+        if use_sampling_interval and (not lastframe or shifted_time-lastframe.get('posix_clock', 0) > sampling_interval):
             useframe = True
             
         if metric_distance and not turning_angle:
@@ -1462,7 +1553,7 @@ def find_files(filelist: list, recursive=False) -> list:
             logger.error("Can't find input file: %s", fname)
             sys.exit(1)
             
-    return inputfiles
+    return sorted(inputfiles)
 
 
 def main():
@@ -1543,6 +1634,11 @@ def main():
                         help='store thumbnails too')
     parser.add_argument('--kml', action='store_true', dest='kml_out',
                         help='produce a KML file showing photo locations')
+    parser.add_argument('--fence', action='store', type=Path,
+                        help='file to read geofences from')
+    parser.add_argument('--keep-night-photos', action='store_true',
+                        help="don't filter out photos taken before "
+                        "local sunrise/after local sunset")
 
     group = parser.add_mutually_exclusive_group()
     group.add_argument('--quiet', '-q', action='store_const', dest='loglevel',
@@ -1554,6 +1650,8 @@ def main():
                        help='show debugging messages too')
     parser.add_argument('--dry-run', '-n', action='store_true',
                         help="run but don't save anything to disk")
+    parser.add_argument('--gallery', action='store_true',
+                        help='create a gallery of all frames - useful for identifying correct time offset')
 
     args = parser.parse_args()
     # print(args)
@@ -1587,7 +1685,21 @@ def main():
     if args.dry_run:
         logger.warning('*** Dry run - no data saved ***')
 
-    kwargs = {'config': config,
+    if args.fence:
+        if not args.fence.is_file():
+            print(args.fence, 'not found', file=sys.stderr)
+            sys.exit(1)
+            
+        geofence_spec = geofence.parse_geofence_spec(args.fence.read_text(),
+                                                     args.fence)
+        if not geofence_spec:
+            logger.error(f'No fence information found in %s, aborting.',
+                         args.fence)
+            sys.exit(1)
+    else:
+        geofence_spec = None
+    
+    kwargs = {'config': config, 'geofence_spec': geofence_spec,
               'use_sampling_interval': use_sampling_interval}
 
     # Hacky but meh... maybe I should just pass args around
@@ -1620,7 +1732,8 @@ def main():
             if future.exception():
                 break
         
-        missing = [fname for fname, count in frames_saved.items() if not count]
+        missing = sorted(fname for fname, count in frames_saved.items()
+                         if not count)
         if missing:
             logger.warning('Files with no frames saved:\n'+
                            os.linesep.join(str(x) for x in missing))
