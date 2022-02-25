@@ -1179,7 +1179,7 @@ class AVVideoWrapper(VideoWrapper):
                  crop_top: int = 0, crop_left: int = 0,
                  crop_bottom: int = 0, crop_right: int = 0):
         self.container = av.open(str(path))
-        self.vidstream = self.container.streams.video[0]
+        self.vidstream: av.video.VideoStream = self.container.streams.video[0]
         self.vidstream.thread_type = 'AUTO'
         self.fps = self.vidstream.average_rate #  1 / self.vidstream.time_base
         self.length = self.vidstream.frames
@@ -1193,6 +1193,9 @@ class AVVideoWrapper(VideoWrapper):
         # Set up image filter graph
         self.graph = av.filter.Graph()
         tail = self.graph.add_buffer(template=self.vidstream)
+        # range_filter = self.graph.add('scale', 'in_range=pc')
+        # tail.link_to(range_filter)
+        # tail = range_filter
         if rotate:
             angle = f'{-rotate}*PI/180'
             rotate_filter = self.graph.add(
@@ -1236,7 +1239,7 @@ class AVVideoWrapper(VideoWrapper):
         for frame in self.frameiter:
             # print('At', frame.time)
             if frame.time >= self.wanted_time:
-                frame = frame.reformat(format='yuv420p')
+                # frame = frame.reformat(format='yuv420p')
                 if self.mask:
                     img = frame.to_image()
                     img = Image.composite(img, img, self.mask)
@@ -1333,29 +1336,56 @@ def locdata_to_gpxsegment(filename, locdata) -> gpxpy.gpx.GPXTrackSegment:
     return gpx_segment
 
 
+def fixup_gpx_order(gpx: gpxpy.gpx.GPX):
+    """Ensure tracks are in chronological order in tracklist."""
+    if not gpx or not gpx.tracks:
+        return gpx
+
+    gpx.tracks.sort(key=gpxpy.gpx.GPXTrack.get_time_bounds)
+    return gpx
+
+
+def get_gps_data(input_ts_file: os.PathLike, tzone: timezone,
+                 make, model, device_override) -> gpxpy.gpx.GPXTrackSegment:
+    logger.debug('Getting GPS data from %s', input_ts_file)
+    locdata, packetno = extract_gps(input_ts_file, tzone, logger,
+                                    make, model, device_override)
+    if not locdata:
+        return None
+    return locdata_to_gpxsegment(input_ts_file, locdata)
+
+
 def get_all_gps(inputfiles: List[os.PathLike], parallel: int, make: str,
                 model: str, device_override: str,
                 tz: float) -> (gpxpy.gpx.GPX, dict):
-    gpx = gpxpy.gpx.GPX()
     tzone = timezone(timedelta(hours=tz))
     ldmap = {}
+
+    if parallel == 1:
+        segments = [get_gps_data(input_ts_file, tzone, make, model,
+                                 device_override)
+                    for input_ts_file in inputfiles]
+    else:
+        with ProcessPoolExecutor(max_workers=parallel) as executor:
+            futures = {executor.submit(get_gps_data, input_ts_file,
+                                       tzone, make, model, device_override):
+                       input_ts_file for input_ts_file in inputfiles}
+            segments = {futures[future]: future.result() for future
+                        in concurrent.futures.as_completed(futures)}
+
+    gpx = gpxpy.gpx.GPX()
     gpx_track = gpxpy.gpx.GPXTrack()
     gpx.tracks.append(gpx_track)
-    for input_ts_file in inputfiles:
-        logger.debug('Getting GPS data from %s', input_ts_file)
-        locdata, packetno = extract_gps(input_ts_file, tzone, logger,
-                                        make, model, device_override)
-        if not locdata:
-            continue
-        gpx_segment = locdata_to_gpxsegment(input_ts_file, locdata)
+    for input_ts_file, gpx_segment in segments.items():
+        if gpx_segment:
+            start_time = gpx_segment.points[0].time
+            end_time = gpx_segment.points[-1].time
+            # start_time, end_time = gpx_segment.get_time_bounds()
+            # trackmap.append((start_time, end_time, gpx_segment))
+            ldmap[input_ts_file] = (start_time, end_time)
+            gpx_track.segments.append(gpx_segment)
 
-        start_time = gpx_segment.points[0].time
-        end_time = gpx_segment.points[-1].time
-        # start_time, end_time = gpx_segment.get_time_bounds()
-        # trackmap.append((start_time, end_time, gpx_segment))
-        ldmap[input_ts_file] = (start_time, end_time)
-        gpx_track.segments.append(gpx_segment)
-
+    gpx = fixup_gpx_order(gpx)
     gpx = clean_gpx(gpx)
     return gpx, ldmap
 
@@ -1609,8 +1639,10 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
         if ext_start <= first_time and ext_end >= last_time:
             position_data = external_gps_data
         else:
-            logger.warning('Ignoring external GPX data for track %s: '
-                           'out of time bounds.', input_ts_file)
+            logger.warning('Ignoring external GPX data for track %s [%s–%s]: '
+                           'out of time bounds [%s–%s].', input_ts_file,
+                           first_time, last_time,
+                           ext_start, ext_end)
 
     # ###Logging
     # if csv_out and not dry_run:
@@ -2077,6 +2109,8 @@ def main():
         gpx_opener = get_opener(args.external_gpx)
         with gpx_opener(args.external_gpx, 'r') as gpxfile:
             external_gps_data = gpxpy.parse(gpxfile)
+            if external_gps_data:
+                external_gps_data = fixup_gpx_order(external_gps_data)
     else:
         external_gps_data = None
 
