@@ -63,6 +63,7 @@ gps_struct = struct.Struct('<I I I I I I ccc x f f f f')
 KNOTS_TO_MPS = 1852.0 / 3600.0
 
 DATETIME_STR_FORMAT = '%Y:%m:%d %H:%M:%S'
+DATE_STR_FORMAT = '%Y:%m:%d'
 
 THUMB_SIZE = 200
 THUMB_QUALITY = 'web_low'
@@ -180,24 +181,40 @@ EXIF_MAPPER = {
 # 7.2mm diagonal - crop factor of ~6 - 6.28 x 3.53mm
 # Pixel size 1.62 µm x 1.62 µm
 
-def build_exif_data(lat, lng, bear, make, model, datetm,
-                    width=None, height=None, speed=None, elevation=None,
-                    exifdata=None, thumbnail=None):
+def build_exif_data(position: gpxpy.gpx.GPXTrackPoint, make: str, model: str,
+                    width: int = None,
+                    height: int = None, exifdata: dict = None,
+                    thumbnail: bytearray = None, bearing_modifier: float = 0):
     """Adds GPS position as EXIF metadata
-    Keyword arguments:
-    lat -- latitude (as float)
-    lng -- longitude (as float)
     """
     if not exifdata:
         exifdata = {}
 
-    lat_deg = to_deg(lat, ["S", "N"])
-    lng_deg = to_deg(lng, ["W", "E"])
+    lat_deg = to_deg(position.latitude, ["S", "N"])
+    lng_deg = to_deg(position.longitude, ["W", "E"])
 
-    exiv_lat = change_to_rational(lat_deg[0]), change_to_rational(lat_deg[1]), change_to_rational(lat_deg[2])
-    exiv_lng = change_to_rational(lng_deg[0]), change_to_rational(lng_deg[1]), change_to_rational(lng_deg[2])
-    nbear = change_to_rational(round(bear, 2))
-    dtstr = datetm.strftime(DATETIME_STR_FORMAT)
+    exiv_lat = tuple(change_to_rational(x) for x in lat_deg[:3])
+    exiv_lng = tuple(change_to_rational(x) for x in lng_deg[:3])
+    bearing = round((position.course + bearing_modifier) % 360, 2)
+    nbear = change_to_rational(bearing)
+    dtstr = position.time.strftime(DATETIME_STR_FORMAT)
+
+    utctime = position.time.astimezone(timezone.utc)
+    utcdatestamp = utctime.strftime(DATE_STR_FORMAT)
+    utctimestamp = (change_to_rational(utctime.hour),
+                    change_to_rational(utctime.minute),
+                    change_to_rational(utctime.second +
+                                       utctime.microsecond / 1000000))
+
+    if position.type_of_gpx_fix is None:
+        measuremode = str(2+(position.elevation is not None))
+    elif position.type_of_gpx_fix == '2d':
+        measuremode = '2'
+    else:
+        measuremode = '3'
+
+    dop = (position.horizontal_dilution if measuremode == '2'
+           else position.position_dilution)
 
     gps_ifd = {
         piexif.GPSIFD.GPSVersionID: (2, 3, 0, 0),
@@ -208,17 +225,26 @@ def build_exif_data(lat, lng, bear, make, model, datetm,
         piexif.GPSIFD.GPSImgDirection: nbear,
         piexif.GPSIFD.GPSImgDirectionRef: 'T',
         piexif.GPSIFD.GPSMapDatum: 'WGS84',
+        piexif.GPSIFD.GPSDateStamp: utcdatestamp,
+        piexif.GPSIFD.GPSTimeStamp: utctimestamp,
+        piexif.GPSIFD.GPSMeasureMode: measuremode,
     }
 
-    if speed is not None:
+    if position.speed is not None:
         gps_ifd[piexif.GPSIFD.GPSSpeed] = change_to_rational(
-            round(speed*3.6, 1))
+            round(position.speed*3.6, 1))
         gps_ifd[piexif.GPSIFD.GPSSpeedRef] = 'K'
 
-    if elevation is not None:
+    if position.elevation is not None:
         gps_ifd[piexif.GPSIFD.GPSAltitude] = change_to_rational(
-            round(abs(elevation), 1))
-        gps_ifd[piexif.GPSIFD.GPSAltitudeRef] = 1 if elevation < 0 else 0
+            round(abs(position.elevation), 1))
+        gps_ifd[piexif.GPSIFD.GPSAltitudeRef] = int(position.elevation < 0)
+
+    if position.satellites is not None:
+        gps_ifd[piexif.GPSIFD.GPSSatellites] = str(position.satellites)
+
+    if dop:
+        gps_ifd[piexif.GPSIFD.GPSDOP] = change_to_rational(round(dop, 2))
 
     zeroth_ifd = {
         piexif.ImageIFD.Make: make,
@@ -326,9 +352,10 @@ def decode_novatek_gps_packet(packet: bytes, tz: tzinfo=timezone.utc,
         # Decode Novatek coordinate format to decimal degrees
         lat = fix_coordinates(lathem, enclat)
         lon = fix_coordinates(lonhem, enclon)
-        mx, my = lonlat_metric(lon, lat)
+        # mx, my = lonlat_metric(lon, lat)
     else:
-        lat = lon = mx = my = None
+        lat = lon = None
+        # mx = my = None
 
     # Validity checks
     if (not (0 <= hour <= 23) or not (0 <= minute <= 59) or
@@ -336,23 +363,27 @@ def decode_novatek_gps_packet(packet: bytes, tz: tzinfo=timezone.utc,
         not (1 <= day <= 31) or not (0 <= bearing <= 360) or
         speed_knots < 0 or active not in b'AV'):
         # Packet is invalid
-        logger.debug('Packet invalid: %s', packet)
-        logger.debug(packet.hex(' '))
-        logger.debug(unpacked)
+        logger.debug('Packet invalid: %s', unpacked)
+        # logger.debug(packet.hex(' '))
+        # logger.debug(unpacked)
         return None
 
-    if active != b'A':
+    ts = datetime(year=2000+year, month=month, day=day, hour=hour,
+                  minute=minute, second=second, tzinfo=tz)
+    if active == b'V':
+        # Time-only fix
+        return dict(ts=ts, active=active, fix='none')
+    elif active != b'A':
         logger.debug('No GPS fix: %s', unpacked)
         return None
 
     speed = speed_knots * KNOTS_TO_MPS
-    ts = datetime(year=2000+year, month=month, day=day, hour=hour,
-                  minute=minute, second=second, tzinfo=tz)
-    clock = ts.timestamp()
 
     return dict(lat=lat, latR=lathem, lon=lon, lonR=lonhem,
-                bearing=bearing, speed=speed, mx=mx, my=my, active=active,
-                metric=0, prevdist=0, ts=ts, posix_clock=clock)
+                bearing=bearing, speed=speed, # mx=mx, my=my,
+                active=active, fix='2d',
+                # metric=0, prevdist=0,
+                ts=ts)
 
 
 def detect_file_type(input_file, device_override='', logger=logging):
@@ -531,18 +562,20 @@ def get_gps_data_garmin (input_ts_file, device, tz):
                 if lat and lon:
                     lat /= 11930464.711111112
                     lon /= 11930464.711111112
-                    mx, my = lonlat_metric(lon, lat)
+                    # mx, my = lonlat_metric(lon, lat)
                 else:
-                    lat = lon = mx = my = None
+                    lat = lon = None
+                    # mx = my = None
 
                 locdata[packetno] = dict(
                     speed=speed_kmh / 3.6,
                     bearing=0, ts=datetime.fromtimestamp(0, timezone.utc),
                     posix_clock=0, active=b'A',
-                    lat=lat, lon=lon, mx=mx, my=my,
+                    lat=lat, lon=lon, # mx=mx, my=my,
                     latR=b'N' if lat >= 0 else b'S',
                     lonR=b'E' if lon >= 0 else b'W',
-                    prevdist=0, metric=0)
+                    # prevdist=0, metric=0,
+                    fix='2d')
                 packetno += 1
 
     return locdata, packetno
@@ -557,14 +590,16 @@ def parse_nmea_rmc(line: bytes, tzone='Z') -> dict:
     lat = fix_coordinates(lathem, rawlat) if rawlat else None
     lon = fix_coordinates(lonhem, rawlon) if rawlon else None
 
-    if rawlat and rawlon:
-        mx, my = lonlat_metric(lon, lat)
-    else:
-        mx = my = None
+    # if rawlat and rawlon:
+    #     mx, my = lonlat_metric(lon, lat)
+    # else:
+    #     mx = my = None
 
     return dict(ts=ts, posix_clock=ts.timestamp(),
                 active=bits[2], lat=lat, latR=lathem, lon=lon,
-                lonR=lonhem, mx=mx, my=my, speed=float(bits[7])*KNOTS_TO_MPS,
+                lonR=lonhem, fix='2d',
+                # mx=mx, my=my,
+                speed=float(bits[7])*KNOTS_TO_MPS,
                 bearing=float(bits[8]), metric=0, prevdist=0)
 
 
@@ -909,10 +944,14 @@ def clean_gpx(gpxdata: gpxpy.gpx.GPX) -> gpxpy.gpx.GPX:
         last_trackno = last_segno = last_pos = -1
         last_point = None
         to_delete = []
+        point: gpxpy.gpx.GPXTrackPoint
         for point, trackno, segno, pos in gpxdata.walk():
-            if last_trackno == trackno and last_segno == segno:
+            if point.type_of_gpx_fix and point.type_of_gpx_fix == 'none':
+                continue
+            if last_point and last_trackno == trackno and last_segno == segno:
                 dist = last_point.distance_2d(point)
                 if dist > 10000:
+                    logger.debug('lp: %s p: %s', last_point, point)
                     logger.debug('Dropping (bogus?) point %d %.1f meters away',
                                  pos, dist)
                     to_delete.append((trackno, segno, pos))
@@ -933,6 +972,9 @@ def clean_gpx(gpxdata: gpxpy.gpx.GPX) -> gpxpy.gpx.GPX:
             prev_start, prev_end = prev_track.get_time_bounds()
             this_start, this_end = track.get_time_bounds()
 
+            if not this_start or not prev_end:
+                continue
+
             print(prev_end, this_start)
             if prev_end <= this_start <= prev_end+epsilon:
                 print('Merging', prev_track, track)
@@ -947,16 +989,6 @@ def clean_gpx(gpxdata: gpxpy.gpx.GPX) -> gpxpy.gpx.GPX:
             prev_track = track
 
     gpxdata.remove_empty()
-                
-    # if gpxlen < 2:
-    #     logger.info(
-    #         'Not enough GPS data for interpolation; need >= 2 points, got %d',
-    #         gpxlen)
-    # elif gpxlen < min_coverage*length*0.01/fps:
-    #     logger.info(
-    #         "Not enough GPS data for interpolation; %d%% needed, %f%% found",
-    #         min_coverage, 100*len(gpxlen)/length*fps)
-
     return gpxdata
 
 
@@ -1200,10 +1232,11 @@ class AVVideoWrapper(VideoWrapper):
 
     def __iter__(self):
         # May need to move forward from keyframe to get the right frame
+        frame: av.VideoFrame
         for frame in self.frameiter:
             # print('At', frame.time)
             if frame.time >= self.wanted_time:
-                frame = frame.to_rgb()
+                frame = frame.reformat(format='yuv420p')
                 if self.mask:
                     img = frame.to_image()
                     img = Image.composite(img, img, self.mask)
@@ -1228,14 +1261,14 @@ class AVVideoWrapper(VideoWrapper):
 
 FNPARSER = re.compile('(\d{4})_?(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})')
 
-def guess_start_time(path: os.PathLike, first_fix_time: datetime,
+def guess_start_time(path: os.PathLike, first_fix_time: datetime=None,
                      tz: float = 0) -> datetime:
     path = Path(path)
     if match := FNPARSER.match(path.stem):
         year, month, day, h, m, s = (int(x) for x in match.groups())
         ts = datetime(year, month, day, h, m, s,
                       tzinfo=timezone(timedelta(hours=tz)))
-        if first_fix_time != ts:
+        if first_fix_time and first_fix_time != ts:
             logger.info('guessed %s log starts at %s', ts, first_fix_time)
         return ts
     return first_fix_time
@@ -1286,11 +1319,15 @@ def locdata_to_gpxsegment(filename, locdata) -> gpxpy.gpx.GPXTrackSegment:
         #     return dict(lat=lat, latR=lathem, lon=lon, lonR=lonhem,
         #bearing=bearing, speed=speed, mx=mx, my=my, active=active,
         #        metric=0, prevdist=0, ts=ts, posix_clock=clock)
-        gpx_point = gpxpy.gpx.GPXTrackPoint(entry['lat'], entry['lon'],
-                                            # elevation=entry.get('ele'),
+        # logger.debug('entry: %s', entry)
+        gpx_point = gpxpy.gpx.GPXTrackPoint(entry.get('lat'),
+                                            entry.get('lon'),
+                                            elevation=entry.get('ele'),
                                             time=entry['ts'],
-                                            speed=entry['speed'])
-        gpx_point.course = entry['bearing']
+                                            speed=entry.get('speed'))
+        gpx_point.course = entry.get('bearing')
+        gpx_point.type_of_gpx_fix = entry.get('fix')
+        # logger.debug('  point: %s', gpx_point)
         gpx_segment.points.append(gpx_point)
 
     return gpx_segment
@@ -1311,59 +1348,49 @@ def get_all_gps(inputfiles: List[os.PathLike], parallel: int, make: str,
         if not locdata:
             continue
         gpx_segment = locdata_to_gpxsegment(input_ts_file, locdata)
-        start_time, end_time = gpx_segment.get_time_bounds()
+
+        start_time = gpx_segment.points[0].time
+        end_time = gpx_segment.points[-1].time
+        # start_time, end_time = gpx_segment.get_time_bounds()
         # trackmap.append((start_time, end_time, gpx_segment))
         ldmap[input_ts_file] = (start_time, end_time)
         gpx_track.segments.append(gpx_segment)
 
     gpx = clean_gpx(gpx)
-
-    # # Merge adjacent segments if needed
-    # trackmap.sort(reverse=True)
-    # start_time, end_time, gpx_segment = trackmap.pop()
-    # print(start_time, end_time, gpx_segment)
-    # gpx_track.segments.append(gpx_segment)
-    # timegap = timedelta(seconds=1)
-    # while trackmap:
-    #     new_start, new_end, new_segment = trackmap.pop()
-    #     if new_start == end_time:
-    #         gpx_segment.remove_point(gpx_segment.get_points_no)
-    #         gpx_segment.join(new_segment)
-    #         end_time = new_end
-    #     elif end_time < new_start <= end_time + timegap:
-    #         gpx_segment.join(new_segment)
-    #         end_time = new_end
-    #     else:
-    #         gpx_track.segments.append(new_segment)
-    #         start_time, end_time, gpx_segment = new_segment
-
     return gpx, ldmap
 
 
 def interpolate_location(gpxdata: gpxpy.gpx.GPX,
                          timestamp: datetime) -> gpxpy.gpx.GPXTrackPoint:
     """Get interpolated location from `gpxdata` at `timestamp`."""
-    prev_point = None
-    track_to_scan = None
+    prev_point: gpxpy.gpx.GPXTrackPoint = None
+    track_to_scan: Union[gpxpy.gpx.GPXTrack,gpxpy.gpx.GPX] = None
+    epsilon = timedelta(seconds=5)
     for track in gpxdata.tracks:
         start, end = track.get_time_bounds()
-        if timestamp >= start and timestamp <= end:
+        if timestamp >= (start - epsilon) and timestamp <= (end + epsilon):
             track_to_scan = track
             break
 
     if not track_to_scan:
         track_to_scan = gpxdata
 
+    point: gpxpy.gpx.GPXTrackPoint
+    epsilon = timedelta(seconds=120)
     for point in track_to_scan.walk(only_points=True):
+        if point.type_of_gpx_fix and point.type_of_gpx_fix == 'none':
+            # Skip points where we don't have a fix
+            continue
         if point.time == timestamp:
             return point
-        elif point.time < timestamp:
+        elif point.time >= (timestamp - epsilon) and point.time < timestamp:
+            # logger.debug('setting prev_point %s for %s', point, timestamp)
             prev_point = point
             # print(prev_point)
-        elif not prev_point:
-            # Don't have anything earlier to use...
-            return point
-        else:
+        # elif not prev_point:
+        #     # Don't have anything earlier to use...
+        #     return point
+        elif prev_point and point.time >= timestamp:
             # Linear interpolation - probably should account for speed change?
             speed = prev_point.speed_between(point)
             course = prev_point.course_between(point)
@@ -1384,9 +1411,39 @@ def interpolate_location(gpxdata: gpxpy.gpx.GPX,
                prev_point.elevation is not None:
                 deltaz = point.elevation - prev_point.elevation
                 newpoint.elevation = prev_point.elevation+deltaz*prop
+                newpoint.type_of_gpx_fix = '3d'
+            else:
+                newpoint.type_of_gpx_fix = '2d'
+
+            # Override fix type if both points agree
+            if point.type_of_gpx_fix == prev_point.type_of_gpx_fix:
+                newpoint.type_of_gpx_fix = point.type_of_gpx_fix
+
+            if point.satellites and prev_point.satellites:
+                newpoint.satellites = min(point.satellites,
+                                          prev_point.satellites)
+
+            if point.horizontal_dilution and prev_point.horizontal_dilution:
+                newpoint.horizontal_dilution = math.sqrt(
+                    point.horizontal_dilution**2 +
+                    prev_point.horizontal_dilution**2)
+
+            if point.vertical_dilution and prev_point.vertical_dilution:
+                newpoint.vertical_dilution = math.sqrt(
+                    point.vertical_dilution**2 +
+                    prev_point.vertical_dilution**2)
+
+            if point.position_dilution and prev_point.position_dilution:
+                newpoint.position_dilution = math.sqrt(
+                    point.position_dilution**2 +
+                    prev_point.position_dilution**2)
 
             # print(newpoint)
             return newpoint
+
+    if not prev_point:
+        # If we get here, no points had a valid fix
+        return None
 
     # If we get here we need to extrapolate
     elapsed_time = (timestamp - prev_point.time).total_seconds()
@@ -1398,6 +1455,9 @@ def interpolate_location(gpxdata: gpxpy.gpx.GPX,
     newpoint = gpxpy.gpx.GPXTrackPoint(newlat, newlon, speed=prev_point.speed,
                                        time=timestamp)
     newpoint.course = prev_point.course
+    newpoint.type_of_gpx_fix = prev_point.type_of_gpx_fix
+    if prev_point.elevation is not None:
+        newpoint.elevation = prev_point.elevation
     # logger.debug('Extrapolated from %s %1.fm %1.f° to %s', prev_point,
     #              distance, prev_point.course, newpoint)
     return newpoint
@@ -1482,7 +1542,26 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
         logger.warning('No GPS data found in %s', input_ts_file)
         return 0
 
-    first_time, last_time = ldmap[input_ts_file]
+    length_seconds = float(length/fps)
+    filename_based_start = guess_start_time(input_ts_file, tz=tz)
+    first_time, last_time = ldmap.get(input_ts_file, (None, None))
+
+    if abs(filename_based_start - first_time).total_seconds() > 600:
+        # Embedded start time is way off
+        logger.warning('Filename says starts at %s, track starts at %s',
+                       filename_based_start, first_time)
+
+    if not first_time and not last_time:
+        start_time = first_time = filename_based_start
+        last_time = filename_based_start + timedelta(seconds=length_seconds)
+        logger.debug('Guessed video range %s–%s', start_time, last_time)
+    else:
+        start_time = min(first_time,
+                         last_time-timedelta(seconds=length_seconds-1))
+        if start_time != filename_based_start:
+            logger.debug('start from onboard GPS: %s  guessed video start: %s',
+                         start_time, filename_based_start)
+
     # gpslen = (last_time - first_time).total_seconds()
 
     # first_time = locdata[min(locdata)]['ts']
@@ -1580,9 +1659,7 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
     # This doesn't seem to be very accurate
     # start_dt = guess_start_time(input_ts_file, locdata[min(locdata)]['ts'], tz)
     # start_dt = locdata[min(locdata)]['ts']
-    logger.debug('f: %s l: %s', first_time, last_time)
-    start_time = min(first_time,
-                     last_time-timedelta(seconds=float((length/fps)-1)))
+    # logger.debug('f: %s l: %s', first_time, last_time)
     logger.debug('%s: guessed first frame at %s', input_ts_file, start_time)
 
     photos = []
@@ -1615,6 +1692,15 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
         # posinfo = interpolate_locdata(locprev, locnext, position=currentpos)
 
         position = interpolate_location(position_data, shifted_time)
+
+        # if external_gps_data:
+        #     pos2 = interpolate_location(internal_gps_data, shifted_time)
+        #     logger.debug('onboard: %s  external: %s', pos2, position)
+
+        if not position:
+            # logger.debug('no fix for frame %d at %s', framecount, shifted_time)
+            framecount += int(1 * fps)
+            continue
 
         if not keep_night_photos and geofence.image_is_dark(
                 position.latitude, position.longitude, shifted_time):
@@ -1705,13 +1791,9 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
             if not success:
                 break
 
-            datetime_taken = position.time
-
             jpgname = f'{fnbase}{count:06d}.{vidext}'
             logger.debug('Would save fr %d: %s' if dry_run
                          else 'Saving fr %d: %s', framecount, jpgname)
-
-            bearing = (position.course + bearing_modifier) % 360
 
             if thumbnails and output_format == 'jpeg':
                 thumbnail = pil_image.copy()
@@ -1723,12 +1805,8 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
 
             width, height = pil_image.size
             exif_bytes = build_exif_data(
-                position.latitude, position.longitude,
-                bearing, make, model, datetime_taken,
-                speed=(position.speed if use_speed else None),
-                elevation=position.elevation,
-                width=width, height=height, exifdata=exifdata,
-                thumbnail=raw_thumbnail)
+                position, make, model, width, height,
+                exifdata, raw_thumbnail, bearing_modifier)
 
             if not dry_run:
                 pil_image.save(jpgname, output_format, **PIL_SAVE_SETTINGS,
