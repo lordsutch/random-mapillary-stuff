@@ -33,13 +33,13 @@ def convert_wgs_to_utm(lon: float, lat: float):
 class Geofence:
     def __init__(self, *shapes):
         self.shapes = list(shapes)
-    
+
     def __contains__(self, point: shapely.geometry.Point) -> bool:
         # for x in self.shapes:
         #     # print(point, x.centroid, point.within(x))
         #     if x.contains(point):
         #         return True
-            
+
         return any(x.contains(point) for x in self.shapes)
 
     def add_shape(self, shape):
@@ -47,7 +47,7 @@ class Geofence:
 
     def __repr__(self):
         return 'Geofence('+','.join(repr(shape) for shape in self.shapes)+')'
-    
+
 
 def dms_to_decimal(coords: tuple, hemisphere: str) -> float:
     '''Convert a DMS tuple to decimal degrees.'''
@@ -58,7 +58,7 @@ def dms_to_decimal(coords: tuple, hemisphere: str) -> float:
 def parse_geofence_spec(spec: str, infile: Path) -> Geofence:
     fence = Geofence()
     lexer = shlex.shlex(spec, infile, posix=True, punctuation_chars=' ')
-    
+
     while token := lexer.get_token():
         if token == 'point':
             lat = float(lexer.get_token())
@@ -78,7 +78,7 @@ def parse_geofence_spec(spec: str, infile: Path) -> Geofence:
         elif token == 'bbox':
             lat1, lon1 = float(lexer.get_token()), float(lexer.get_token())
             lat2, lon2 = float(lexer.get_token()), float(lexer.get_token())
-            
+
             fence.add_shape(shapely.geometry.Polygon(
                 ((lon1, lat1), (lon2, lat1), (lon2, lat2), (lon1, lat2))))
         elif token == 'poly':
@@ -94,7 +94,7 @@ def parse_geofence_spec(spec: str, infile: Path) -> Geofence:
         else:
             print(f'{lexer.error_leader()}Unknown token {token}',
                   file=sys.stderr)
-    
+
     return fence
 
 
@@ -151,10 +151,10 @@ def geofence_file(imgfile: os.PathLike, fence: Geofence,
     dto = my_image.get('datetime_original', '')
     imgtime = datetime.datetime.strptime(dto, '%Y:%m:%d %H:%M:%S').replace(
         tzinfo=datetime.timezone.utc)
-    
+
     if not geofence_image(fence, dlat, dlon, imgtime, filter_dark):
         return
-    
+
     if strip_gps:
         for tag in my_image.list_all():
             if tag.startswith('gps_'):
@@ -174,7 +174,7 @@ def geofence_file(imgfile: os.PathLike, fence: Geofence,
         new_filename = Path(move_to) / (save_as or imgfile).name
         imgfile.rename(new_filename)
         return new_filename
-    
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
@@ -213,7 +213,7 @@ if __name__ == '__main__':
         if not args.fence.is_file():
             print(args.fence, 'not found', file=sys.stderr)
             sys.exit(1)
-            
+
         fence = parse_geofence_spec(args.fence.read_text(), args.fence)
         if not fence:
             print(f'No fence information found in {args.fence}, aborting.')
@@ -221,7 +221,7 @@ if __name__ == '__main__':
 
     if not Path(args.move).is_dir():
         os.makedirs(args.move)
-            
+
     filtered = []
     for path in Bar('Geofencing').iter(to_process):
         filtered_file = geofence_file(path, fence, move_to=args.move,
@@ -229,6 +229,6 @@ if __name__ == '__main__':
                                       filter_dark=not args.keep_night_photos)
         if filtered_file:
             filtered.append(filtered_file)
-            
+
     if len(filtered):
         print(f'Filtered {len(filtered)} files.')
