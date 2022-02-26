@@ -97,7 +97,7 @@ class suppress_stdout_stderr(object): #from here: https://stackoverflow.com/ques
     '''
     def __init__(self):
         # Open a pair of null files
-        self.null_fds =  [os.open(os.devnull,os.O_RDWR) for x in range(2)]
+        self.null_fds = [os.open(os.devnull,os.O_RDWR) for x in range(2)]
         # Save the actual stdout (1) and stderr (2) file descriptors.
         self.save_fds = [os.dup(1), os.dup(2)]
 
@@ -2147,15 +2147,13 @@ def main():
                            os.linesep.join(str(x) for x in missing))
         return
 
-    with ThreadPoolExecutor(max_workers=args.parallel) as executor:
-        threads = {filename: executor.submit(process_video_with_exceptions,
-                                             filename, **kwargs)
+    with ProcessPoolExecutor(max_workers=args.parallel) as executor:
+        threads = {executor.submit(process_video_with_exceptions,
+                                   filename, **kwargs): filename
                    for filename in inputfiles}
 
-        for filename, future in threads.items():
-            frames_saved[filename] = future.result()
-            if future.exception():
-                break
+        frames_saved = {threads[future]: future.result() for future
+                        in concurrent.futures.as_completed(threads)}
 
         missing = sorted(fname for fname, count in frames_saved.items()
                          if not count)
