@@ -1181,7 +1181,7 @@ class AVVideoWrapper(VideoWrapper):
         self.container = av.open(str(path))
         self.vidstream: av.video.VideoStream = self.container.streams.video[0]
         self.vidstream.thread_type = 'AUTO'
-        self.fps = self.vidstream.average_rate #  1 / self.vidstream.time_base
+        self.fps = self.vidstream.average_rate  # 1 / self.vidstream.time_base
         self.length = self.vidstream.frames
         self.wanted_time = 0
         self.mask = Image.open(maskfile) if maskfile else None
@@ -1193,7 +1193,7 @@ class AVVideoWrapper(VideoWrapper):
         # Set up image filter graph
         self.graph = av.filter.Graph()
         tail = self.graph.add_buffer(template=self.vidstream)
-        # range_filter = self.graph.add('scale', 'in_range=pc')
+        # range_filter = self.graph.add('setparams', 'range=pc')
         # tail.link_to(range_filter)
         # tail = range_filter
         if rotate:
@@ -1576,7 +1576,8 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
     filename_based_start = guess_start_time(input_ts_file, tz=tz)
     first_time, last_time = ldmap.get(input_ts_file, (None, None))
 
-    if abs(filename_based_start - first_time).total_seconds() > 600:
+    if first_time and \
+       abs(filename_based_start - first_time).total_seconds() > 600:
         # Embedded start time is way off
         logger.warning('Filename says starts at %s, track starts at %s',
                        filename_based_start, first_time)
