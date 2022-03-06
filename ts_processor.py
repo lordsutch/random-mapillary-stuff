@@ -3,6 +3,7 @@
 
 import argparse
 # import base64
+import bisect
 import bz2
 import cgitb
 import concurrent.futures
@@ -33,7 +34,7 @@ from fractions import Fraction
 from functools import cache
 from itertools import groupby, accumulate
 from pathlib import Path
-from typing import Optional, List, Callable, TextIO
+from typing import Optional, List, Callable, TextIO, Union
 
 import av
 import av.filter
@@ -97,7 +98,7 @@ class suppress_stdout_stderr(object): #from here: https://stackoverflow.com/ques
     '''
     def __init__(self):
         # Open a pair of null files
-        self.null_fds = [os.open(os.devnull,os.O_RDWR) for x in range(2)]
+        self.null_fds = [os.open(os.devnull, os.O_RDWR) for x in range(2)]
         # Save the actual stdout (1) and stderr (2) file descriptors.
         self.save_fds = [os.dup(1), os.dup(2)]
 
@@ -114,17 +115,18 @@ class suppress_stdout_stderr(object): #from here: https://stackoverflow.com/ques
         for fd in self.null_fds + self.save_fds:
             os.close(fd)
 
+
 def to_deg(value, loc):  #From here: https://gist.github.com/c060604
     """convert decimal coordinates into degrees, munutes and seconds tuple
     Keyword arguments: value is float gps-value, loc is direction list ["S", "N"] or ["W", "E"]
     return: tuple like (25, 13, 48.343 ,'N')
     """
-    loc_value = loc[0] if value < 0 else loc[1]
+    loc_value = loc[int(value >= 0)]
 
     degrees, minutes = divmod(abs(value), 1)
     minutes, seconds = divmod(minutes*60, 1)
 
-    return (int(degrees), int(minutes), round(seconds*60, 5), loc_value)
+    return (int(degrees), int(minutes), seconds*60, loc_value)
     # deg =  int(abs_value)
     # t1 = (abs_value-deg)*60
     # minutes = int(t1)
@@ -142,7 +144,7 @@ def rotatedRectWithMaxArea(w, h, angle):
         return 0, 0
 
     width_is_longer = w >= h
-    side_long, side_short = (w, h) if width_is_longer else (h,w)
+    side_long, side_short = (w, h) if width_is_longer else (h, w)
 
     # since the solutions for angle, -angle and 180-angle are all the same,
     # if suffices to look at the first quadrant and the absolute values of sin,cos:
@@ -161,12 +163,13 @@ def rotatedRectWithMaxArea(w, h, angle):
 
 
 def change_to_rational(number):
-    """convert a number to rantional
+    """convert a number to rational
     Keyword arguments: number
     return: tuple like (1, 2), (numerator, denominator)
     """
     f = Fraction(number).limit_denominator()
     return (f.numerator, f.denominator)
+
 
 EXIF_MAPPER = {
     'max aperature': (piexif.ExifIFD.MaxApertureValue,
@@ -190,8 +193,8 @@ def build_exif_data(position: gpxpy.gpx.GPXTrackPoint, make: str, model: str,
     if not exifdata:
         exifdata = {}
 
-    lat_deg = to_deg(position.latitude, ["S", "N"])
-    lng_deg = to_deg(position.longitude, ["W", "E"])
+    lat_deg = to_deg(round(position.latitude, 7), ["S", "N"])
+    lng_deg = to_deg(round(position.longitude, 7), ["W", "E"])
 
     exiv_lat = tuple(change_to_rational(x) for x in lat_deg[:3])
     exiv_lng = tuple(change_to_rational(x) for x in lng_deg[:3])
@@ -378,7 +381,6 @@ def decode_novatek_gps_packet(packet: bytes, tz: tzinfo=timezone.utc,
         return None
 
     speed = speed_knots * KNOTS_TO_MPS
-
     return dict(lat=lat, latR=lathem, lon=lon, lonR=lonhem,
                 bearing=bearing, speed=speed, # mx=mx, my=my,
                 active=active, fix='2d',
@@ -656,7 +658,7 @@ def get_gps_data_ts (input_ts_file, device, tz, logger=logging):
     with open(input_ts_file, "rb") as f:
         with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
             mm.madvise(mmap.MADV_SEQUENTIAL)
-            input_packet = mm.read(188) #First packet, try to autodetect
+            input_packet = mm.read(188) # First packet, try to autodetect
 
             while True:
                 input_packet = mm.read(188)
@@ -829,7 +831,7 @@ def interpolate_track(locdata: dict, res: float = 1.0, num: int = 0, deg: int = 
         return locdata
 
     # Convert track to gpx_interpolate format
-    gpxdata = {'lat' : [], 'lon': [], 'tstamp': [], 'ele': [],
+    gpxdata = {'lat': [], 'lon': [], 'tstamp': [], 'ele': [],
                'tzinfo': timezone.utc}
     for point in locdata.values():
         gpxdata['lat'].append(point['lat'])
@@ -937,6 +939,9 @@ def extract_gps(input_ts_file: os.PathLike, tzone, logger,
     return locdata, packetno
 
 
+MERGE_EPSILON = timedelta(seconds=1)
+
+
 def clean_gpx(gpxdata: gpxpy.gpx.GPX) -> gpxpy.gpx.GPX:
     """Remove garbage GPS data."""
     gpxlen = gpxdata.get_points_no()
@@ -966,7 +971,6 @@ def clean_gpx(gpxdata: gpxpy.gpx.GPX) -> gpxpy.gpx.GPX:
 
     # Merge adjacent tracks if close in time
     prev_track = None
-    epsilon = timedelta(seconds=1)
     for track in gpxdata.tracks:
         if prev_track:
             prev_start, prev_end = prev_track.get_time_bounds()
@@ -976,7 +980,7 @@ def clean_gpx(gpxdata: gpxpy.gpx.GPX) -> gpxpy.gpx.GPX:
                 continue
 
             print(prev_end, this_start)
-            if prev_end <= this_start <= prev_end+epsilon:
+            if prev_end <= this_start <= prev_end+MERGE_EPSILON:
                 print('Merging', prev_track, track)
                 for seg in track.segments:
                     prev_track.segments.append(seg)
@@ -1341,6 +1345,9 @@ def fixup_gpx_order(gpx: gpxpy.gpx.GPX):
     if not gpx or not gpx.tracks:
         return gpx
 
+    for track in gpx.tracks:
+        track.segments.sort(key=gpxpy.gpx.GPXTrackSegment.get_time_bounds)
+
     gpx.tracks.sort(key=gpxpy.gpx.GPXTrack.get_time_bounds)
     return gpx
 
@@ -1390,86 +1397,91 @@ def get_all_gps(inputfiles: List[os.PathLike], parallel: int, make: str,
     return gpx, ldmap
 
 
+INTERPOLATE_EPSILON = timedelta(seconds=120)
+SCAN_EPSILON = timedelta(seconds=5)
+
+
 def interpolate_location(gpxdata: gpxpy.gpx.GPX,
                          timestamp: datetime) -> gpxpy.gpx.GPXTrackPoint:
     """Get interpolated location from `gpxdata` at `timestamp`."""
+    point: gpxpy.gpx.GPXTrackPoint
     prev_point: gpxpy.gpx.GPXTrackPoint = None
-    track_to_scan: Union[gpxpy.gpx.GPXTrack,gpxpy.gpx.GPX] = None
-    epsilon = timedelta(seconds=5)
+    tracks_to_scan: List[gpxpy.gpx.GPXTrack] = None
+
     for track in gpxdata.tracks:
         start, end = track.get_time_bounds()
-        if timestamp >= (start - epsilon) and timestamp <= (end + epsilon):
-            track_to_scan = track
+        if (start - SCAN_EPSILON) <= timestamp <= (end + SCAN_EPSILON):
+            tracks_to_scan = [track]
             break
 
-    if not track_to_scan:
-        track_to_scan = gpxdata
+    if not tracks_to_scan:
+        tracks_to_scan = gpxdata.tracks
 
-    point: gpxpy.gpx.GPXTrackPoint
-    epsilon = timedelta(seconds=120)
-    for point in track_to_scan.walk(only_points=True):
-        if point.type_of_gpx_fix and point.type_of_gpx_fix == 'none':
-            # Skip points where we don't have a fix
-            continue
-        if point.time == timestamp:
-            return point
-        elif point.time >= (timestamp - epsilon) and point.time < timestamp:
-            # logger.debug('setting prev_point %s for %s', point, timestamp)
-            prev_point = point
-            # print(prev_point)
-        # elif not prev_point:
-        #     # Don't have anything earlier to use...
-        #     return point
-        elif prev_point and point.time >= timestamp:
-            # Linear interpolation - probably should account for speed change?
-            speed = prev_point.speed_between(point)
-            course = prev_point.course_between(point)
-            numerator = (timestamp - prev_point.time).total_seconds()
-            denominator = point.time_difference(prev_point)
-            prop = numerator/denominator
+    # XXX - probably faster to do some sort of bisection search
+    for track in tracks_to_scan:
+        for point in track.walk(only_points=True):
+            if point.type_of_gpx_fix and point.type_of_gpx_fix == 'none':
+                # Skip points where we don't have a fix
+                continue
+            if point.time == timestamp:
+                return point
+            elif timestamp > point.time >= (timestamp - INTERPOLATE_EPSILON):
+                # logger.debug('setting prev_point %s for %s', point, timestamp)
+                prev_point = point
+                # print(prev_point)
+            # elif not prev_point:
+            #     # Don't have anything earlier to use...
+            #     return point
+            elif prev_point and point.time >= timestamp:
+                # Linear interpolation - probably should account for speed change?
+                speed = prev_point.speed_between(point)
+                course = prev_point.course_between(point)
+                numerator = (timestamp - prev_point.time).total_seconds()
+                denominator = point.time_difference(prev_point)
+                prop = numerator/denominator
 
-            x1, y1 = lonlat_metric(prev_point.longitude, prev_point.latitude)
-            x2, y2 = lonlat_metric(point.longitude, point.latitude)
-            deltax, deltay = x2-x1, y2-y1
-            lon, lat = metric_lonlat(x1+deltax*prop, y1+deltay*prop)
+                x1, y1 = lonlat_metric(prev_point.longitude, prev_point.latitude)
+                x2, y2 = lonlat_metric(point.longitude, point.latitude)
+                deltax, deltay = x2-x1, y2-y1
+                lon, lat = metric_lonlat(x1+deltax*prop, y1+deltay*prop)
 
-            newpoint = gpxpy.gpx.GPXTrackPoint(lat, lon, time=timestamp,
-                                               speed=speed)
-            newpoint.course = course
+                newpoint = gpxpy.gpx.GPXTrackPoint(lat, lon, time=timestamp,
+                                                   speed=speed)
+                newpoint.course = course
 
-            if point.elevation is not None and \
-               prev_point.elevation is not None:
-                deltaz = point.elevation - prev_point.elevation
-                newpoint.elevation = prev_point.elevation+deltaz*prop
-                newpoint.type_of_gpx_fix = '3d'
-            else:
-                newpoint.type_of_gpx_fix = '2d'
+                if point.elevation is not None and \
+                   prev_point.elevation is not None:
+                    deltaz = point.elevation - prev_point.elevation
+                    newpoint.elevation = prev_point.elevation+deltaz*prop
+                    newpoint.type_of_gpx_fix = '3d'
+                else:
+                    newpoint.type_of_gpx_fix = '2d'
 
-            # Override fix type if both points agree
-            if point.type_of_gpx_fix == prev_point.type_of_gpx_fix:
-                newpoint.type_of_gpx_fix = point.type_of_gpx_fix
+                # Override fix type if both points agree
+                if point.type_of_gpx_fix == prev_point.type_of_gpx_fix:
+                    newpoint.type_of_gpx_fix = point.type_of_gpx_fix
 
-            if point.satellites and prev_point.satellites:
-                newpoint.satellites = min(point.satellites,
-                                          prev_point.satellites)
+                if point.satellites and prev_point.satellites:
+                    newpoint.satellites = min(point.satellites,
+                                              prev_point.satellites)
 
-            if point.horizontal_dilution and prev_point.horizontal_dilution:
-                newpoint.horizontal_dilution = math.sqrt(
-                    point.horizontal_dilution**2 +
-                    prev_point.horizontal_dilution**2)
+                if point.horizontal_dilution and prev_point.horizontal_dilution:
+                    newpoint.horizontal_dilution = math.sqrt(
+                        point.horizontal_dilution**2 +
+                        prev_point.horizontal_dilution**2)
 
-            if point.vertical_dilution and prev_point.vertical_dilution:
-                newpoint.vertical_dilution = math.sqrt(
-                    point.vertical_dilution**2 +
-                    prev_point.vertical_dilution**2)
+                if point.vertical_dilution and prev_point.vertical_dilution:
+                    newpoint.vertical_dilution = math.sqrt(
+                        point.vertical_dilution**2 +
+                        prev_point.vertical_dilution**2)
 
-            if point.position_dilution and prev_point.position_dilution:
-                newpoint.position_dilution = math.sqrt(
-                    point.position_dilution**2 +
-                    prev_point.position_dilution**2)
+                if point.position_dilution and prev_point.position_dilution:
+                    newpoint.position_dilution = math.sqrt(
+                        point.position_dilution**2 +
+                        prev_point.position_dilution**2)
 
-            # print(newpoint)
-            return newpoint
+                # print(newpoint)
+                return newpoint
 
     if not prev_point:
         # If we get here, no points had a valid fix
@@ -1533,6 +1545,7 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
         logger.warning('%s is empty', input_ts_file)
         return 0
 
+    # XXX - move this code so we don't have to execute it each time
     if not config:
         config = configparser.ConfigParser()
 
@@ -1562,6 +1575,8 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
     if sensor_width and focal_length:
         crop_factor = 35/sensor_width
         exifdata['35mm equivalent focal length'] = focal_length*crop_factor
+
+    # XXX end of code to move
 
     interval = int(sampling_interval*fps)
     if interval == 0:
@@ -2108,7 +2123,7 @@ def main():
     if args.external_gpx:
         logger.debug('Reading external GPX file %s', args.external_gpx)
         gpx_opener = get_opener(args.external_gpx)
-        with gpx_opener(args.external_gpx, 'r') as gpxfile:
+        with gpx_opener(args.external_gpx, 'rt') as gpxfile:
             external_gps_data = gpxpy.parse(gpxfile)
             if external_gps_data:
                 external_gps_data = fixup_gpx_order(external_gps_data)
