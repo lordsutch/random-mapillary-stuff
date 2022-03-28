@@ -34,7 +34,7 @@ from fractions import Fraction
 from functools import cache
 from itertools import groupby, accumulate
 from pathlib import Path
-from typing import Optional, List, Callable, TextIO, Union
+from typing import Optional, List, Callable, TextIO, Union, Iterable
 
 import av
 import av.filter
@@ -69,10 +69,10 @@ DATE_STR_FORMAT = '%Y:%m:%d'
 THUMB_SIZE = 200
 THUMB_QUALITY = 'web_low'
 
-PIL_SAVE_SETTINGS = dict(quality=90,
+PIL_SAVE_SETTINGS = dict(quality=85,
                          # 4:2:0;  Source subsampling isn't better
                          subsampling=2,
-                         optimize=True,
+                         # optimize=True,
                          progressive=True)
 
 EXTENSIONS = {'jpeg': 'jpg'}
@@ -104,19 +104,19 @@ class suppress_stdout_stderr(object): #from here: https://stackoverflow.com/ques
 
     def __enter__(self):
         # Assign the null pointers to stdout and stderr.
-        os.dup2(self.null_fds[0],1)
-        os.dup2(self.null_fds[1],2)
+        os.dup2(self.null_fds[0] ,1)
+        os.dup2(self.null_fds[1] ,2)
 
     def __exit__(self, *_):
         # Re-assign the real stdout/stderr back to (1) and (2)
-        os.dup2(self.save_fds[0],1)
-        os.dup2(self.save_fds[1],2)
+        os.dup2(self.save_fds[0] ,1)
+        os.dup2(self.save_fds[1] ,2)
         # Close all file descriptors
         for fd in self.null_fds + self.save_fds:
             os.close(fd)
 
 
-def to_deg(value, loc):  #From here: https://gist.github.com/c060604
+def to_deg(value: float, loc: Iterable):  #From here: https://gist.github.com/c060604
     """convert decimal coordinates into degrees, munutes and seconds tuple
     Keyword arguments: value is float gps-value, loc is direction list ["S", "N"] or ["W", "E"]
     return: tuple like (25, 13, 48.343 ,'N')
@@ -193,8 +193,8 @@ def build_exif_data(position: gpxpy.gpx.GPXTrackPoint, make: str, model: str,
     if not exifdata:
         exifdata = {}
 
-    lat_deg = to_deg(round(position.latitude, 7), ["S", "N"])
-    lng_deg = to_deg(round(position.longitude, 7), ["W", "E"])
+    lat_deg = to_deg(round(position.latitude, 7), ("S", "N"))
+    lng_deg = to_deg(round(position.longitude, 7), ("W", "E"))
 
     exiv_lat = tuple(change_to_rational(x) for x in lat_deg[:3])
     exiv_lng = tuple(change_to_rational(x) for x in lng_deg[:3])
@@ -446,13 +446,16 @@ def detect_file_type(input_file, device_override='', logger=logging):
                                             mm[mm.tell():mm.tell()+8])
                     # Save some parsing overhead since we don't care...
                     if lazybox[1] in (b'ftyp', b'mdat', b'skip') and lazybox[0] > 1:
-                        mm.seek(lazybox[0], os.SEEK_CUR)
+                        try:
+                            mm.seek(lazybox[0], os.SEEK_CUR)
+                        except ValueError:
+                            mm.seek(0, os.SEEK_END)
                         continue
 
                     try:
                         box = Box.parse_stream(mm)
                     except:
-                        pass
+                        continue
                     # print(box.type.decode("utf-8"))
                     if box.type == b"free":
                         length = len(box.data)
@@ -1362,7 +1365,7 @@ def get_gps_data(input_ts_file: os.PathLike, tzone: timezone,
     return locdata_to_gpxsegment(input_ts_file, locdata)
 
 
-def get_all_gps(inputfiles: List[os.PathLike], parallel: int, make: str,
+def get_all_gps(inputfiles: Iterable[os.PathLike], parallel: int, make: str,
                 model: str, device_override: str,
                 tz: float) -> (gpxpy.gpx.GPX, dict):
     tzone = timezone(timedelta(hours=tz))
@@ -1905,7 +1908,7 @@ def process_video_with_exceptions(infile: os.PathLike, folder: os.PathLike,
         raise
 
 
-def find_files(filelist: List[os.PathLike],
+def find_files(filelist: Iterable[os.PathLike],
                recursive=False) -> List[os.PathLike]:
     inputfiles = []
     for fname in filelist:
@@ -1950,12 +1953,13 @@ def find_files(filelist: List[os.PathLike],
                         if VALID_FILENAME.match(str(f)))
             else:
                 inputfiles += (f for f in p.iterdir()
-                               if VALID_FILENAME.match(str(f)))
+                               if VALID_FILENAME.match(f.stem + f.suffix))
         else:
             logger.error("Can't find input file: %s", fname)
             sys.exit(1)
 
-    return sorted(inputfiles)
+    inputfiles.sort()
+    return inputfiles
 
 
 def get_opener(filename: str) -> Callable[..., TextIO]:
