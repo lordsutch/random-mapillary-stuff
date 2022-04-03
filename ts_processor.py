@@ -1326,9 +1326,6 @@ def create_galleryview(video, frame, posinfo, basedir, prevframe,
 def locdata_to_gpxsegment(filename, locdata) -> gpxpy.gpx.GPXTrackSegment:
     gpx_segment = gpxpy.gpx.GPXTrackSegment()
     for entry in locdata.values():
-        #     return dict(lat=lat, latR=lathem, lon=lon, lonR=lonhem,
-        #bearing=bearing, speed=speed, mx=mx, my=my, active=active,
-        #        metric=0, prevdist=0, ts=ts, posix_clock=clock)
         # logger.debug('entry: %s', entry)
         gpx_point = gpxpy.gpx.GPXTrackPoint(entry.get('lat'),
                                             entry.get('lon'),
@@ -1337,7 +1334,7 @@ def locdata_to_gpxsegment(filename, locdata) -> gpxpy.gpx.GPXTrackSegment:
                                             speed=entry.get('speed'))
         gpx_point.course = entry.get('bearing')
         gpx_point.type_of_gpx_fix = entry.get('fix')
-        # logger.debug('  point: %s', gpx_point)
+        # logger.debug('  point: %s', repr(gpx_point))
         gpx_segment.points.append(gpx_point)
 
     return gpx_segment
@@ -1372,9 +1369,9 @@ def get_all_gps(inputfiles: Iterable[os.PathLike], parallel: int, make: str,
     ldmap = {}
 
     if parallel == 1:
-        segments = [get_gps_data(input_ts_file, tzone, make, model,
-                                 device_override)
-                    for input_ts_file in inputfiles]
+        segments = {input_ts_file: get_gps_data(input_ts_file, tzone, make,
+                                                model, device_override)
+                    for input_ts_file in inputfiles}
     else:
         with ProcessPoolExecutor(max_workers=parallel) as executor:
             futures = {executor.submit(get_gps_data, input_ts_file,
@@ -1437,8 +1434,8 @@ def interpolate_location(gpxdata: gpxpy.gpx.GPX,
             #     return point
             elif prev_point and point.time >= timestamp:
                 # Linear interpolation - probably should account for speed change?
-                speed = prev_point.speed_between(point)
-                course = prev_point.course_between(point)
+                speed = point.speed_between(prev_point)
+                course = point.course_between(prev_point)
                 numerator = (timestamp - prev_point.time).total_seconds()
                 denominator = point.time_difference(prev_point)
                 prop = numerator/denominator
@@ -1644,12 +1641,12 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
     #         csvfile.writeheader()
     #         csvfile.writerows(locdata.values())
 
-    if gpx_out and not dry_run:
-        internal_gps_data.name = f'GPS data extracted from {make} {model}'
-        gpxtree = internal_gps_data.to_xml()
-        # build_gpxtree(locdata, make, model)
-        with open(f'{fnbase}pre_interp.gpx', 'w') as fob:
-            fob.write(gpxtree)
+    # if gpx_out and not dry_run:
+    #     internal_gps_data.name = f'GPS data extracted from {make} {model}'
+    #     gpxtree = internal_gps_data.to_xml(version="1.0")
+    #     # build_gpxtree(locdata, make, model)
+    #     with open(f'{fnbase}pre_interp.gpx', 'w') as fob:
+    #         fob.write(gpxtree)
     ###
 
     position_data = internal_gps_data
@@ -1671,11 +1668,11 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
     #         csvfile.writeheader()
     #         csvfile.writerows(locdata.values())
 
-    if gpx_out and not dry_run:
-        gpxtree = internal_gps_data.to_xml()
-        with open(f'{fnbase}post_interp.gpx', 'w') as fob:
-            fob.write(gpxtree)
-        # gpxtree = build_gpxtree(locdata, make, model)
+    # if gpx_out and not dry_run:
+    #     gpxtree = internal_gps_data.to_xml(version="1.0")
+    #     with open(f'{fnbase}post_interp.gpx', 'w') as fob:
+    #         fob.write(gpxtree)
+    #     # gpxtree = build_gpxtree(locdata, make, model)
 
     ###
 
@@ -2138,6 +2135,18 @@ def main():
     internal_gps_data, ldmap = get_all_gps(
         inputfiles, args.parallel, make, model,
         args.device_override, args.tz)
+
+    if args.gpx_out and not args.dry_run:
+        if make and model:
+            internal_gps_data.name = f'GPS data extracted from {make} {model}'
+        gpxtree = internal_gps_data.to_xml(version='1.0')
+        if not os.path.exists(args.folder):
+            os.makedirs(args.folder)
+
+        outfile = os.path.join(args.folder, 'extracted_tracks.gpx')
+        logger.debug('Saving extracted location data to %s', outfile)
+        with open(outfile, 'w') as fob:
+            fob.write(gpxtree)
 
     kwargs = {'config': config, 'geofence_spec': geofence_spec,
               'use_sampling_interval': use_sampling_interval,
