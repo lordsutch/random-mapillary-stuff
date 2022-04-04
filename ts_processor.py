@@ -1651,10 +1651,13 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
 
     position_data = internal_gps_data
     if external_gps_data:
-        ext_start, ext_end = external_gps_data.get_time_bounds()
-        if ext_start <= first_time and ext_end >= last_time:
-            position_data = external_gps_data
-        else:
+        for track in external_gps_data.tracks:
+            ext_start, ext_end = external_gps_data.get_time_bounds()
+            if ext_start <= first_time and ext_end >= last_time:
+                position_data = track
+
+        if position_data == internal_gps_data:
+            ext_start, ext_end = external_gps_data.get_time_bounds()
             logger.warning('Ignoring external GPX data for track %s [%s–%s]: '
                            'out of time bounds [%s–%s].', input_ts_file,
                            first_time, last_time,
