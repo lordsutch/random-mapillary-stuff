@@ -1532,11 +1532,15 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
     exifdata = {}
 
     with vidcontext():
-        video = AVVideoWrapper(input_ts_file, maskfile, rotate,
-                               keep_aspect_ratio,
-                               crop_top, crop_left,
-                               crop_bottom, crop_right)
-        video_iterator = iter(video)
+        try:
+            video = AVVideoWrapper(input_ts_file, maskfile, rotate,
+                                   keep_aspect_ratio,
+                                   crop_top, crop_left,
+                                   crop_bottom, crop_right)
+            video_iterator = iter(video)
+        except av.error.InvalidDataError as exc:
+            logger.warning('%s is invalid: %s', input_ts_file, exc)
+            return 0
 
     fps, length = video.fps, video.length
     logger.debug('FPS: %d; LEN: %d', fps, length)
