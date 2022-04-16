@@ -39,7 +39,6 @@ class Geofence:
         #     # print(point, x.centroid, point.within(x))
         #     if x.contains(point):
         #         return True
-
         return any(x.contains(point) for x in self.shapes)
 
     def add_shape(self, shape):
@@ -47,6 +46,10 @@ class Geofence:
 
     def __repr__(self):
         return 'Geofence('+','.join(repr(shape) for shape in self.shapes)+')'
+
+    def position_in_fence(self, latitude: float, longitude: float) -> bool:
+        point = shapely.geometry.Point(longitude, latitude)
+        return point in self
 
 
 def dms_to_decimal(coords: tuple, hemisphere: str) -> float:
@@ -121,7 +124,6 @@ def geofence_image(fence: Geofence, lat: float, lon: float,
     '''Returns True if we should keep the image, False otherwise.'''
     filtered = image_is_dark(lat, lon, imgtime) if filter_dark else False
     position = shapely.geometry.Point(lon, lat)
-
     return (filtered or position in fence)
 
 
