@@ -1401,21 +1401,24 @@ INTERPOLATE_EPSILON = timedelta(seconds=120)
 SCAN_EPSILON = timedelta(seconds=5)
 
 
-def interpolate_location(gpxdata: gpxpy.gpx.GPX,
+def interpolate_location(gpxdata: Union[gpxpy.gpx.GPX, gpxpy.gpx.GPXTrack],
                          timestamp: datetime) -> gpxpy.gpx.GPXTrackPoint:
     """Get interpolated location from `gpxdata` at `timestamp`."""
     point: gpxpy.gpx.GPXTrackPoint
     prev_point: gpxpy.gpx.GPXTrackPoint = None
     tracks_to_scan: List[gpxpy.gpx.GPXTrack] = None
 
-    for track in gpxdata.tracks:
-        start, end = track.get_time_bounds()
-        if (start - SCAN_EPSILON) <= timestamp <= (end + SCAN_EPSILON):
-            tracks_to_scan = [track]
-            break
+    if hasattr(gpxdata, 'tracks'):
+        for track in gpxdata.tracks:
+            start, end = track.get_time_bounds()
+            if (start - SCAN_EPSILON) <= timestamp <= (end + SCAN_EPSILON):
+                tracks_to_scan = [track]
+                break
 
-    if not tracks_to_scan:
-        tracks_to_scan = gpxdata.tracks
+        if not tracks_to_scan:
+            tracks_to_scan = gpxdata.tracks
+    else:
+        tracks_to_scan = [gpxdata]
 
     # XXX - probably faster to do some sort of bisection search
     for track in tracks_to_scan:
@@ -1435,7 +1438,7 @@ def interpolate_location(gpxdata: gpxpy.gpx.GPX,
             elif prev_point and point.time >= timestamp:
                 # Linear interpolation - probably should account for speed change?
                 speed = point.speed_between(prev_point)
-                course = point.course_between(prev_point)
+                course = prev_point.course_between(point)
                 numerator = (timestamp - prev_point.time).total_seconds()
                 denominator = point.time_difference(prev_point)
                 prop = numerator/denominator
@@ -1517,11 +1520,12 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
                   max_aperature=None, rotate: float=0, output_format='jpeg',
                   focal_length=None, min_coverage=90,
                   keep_aspect_ratio=False, gallery=False,
-                  keep_night_photos=False, geofence_spec=None,
+                  keep_night_photos=False,
+                  geofence_spec: geofence.Geofence = None,
                   # csv_out=False,
                   gpx_out=False, dry_run=False,
-                  external_gps_data: gpxpy.gpx.GPX=None,
-                  internal_gps_data: gpxpy.gpx.GPX=None,
+                  external_gps_data: gpxpy.gpx.GPX = None,
+                  internal_gps_data: gpxpy.gpx.GPX = None,
                   ldmap=None) -> int:
     logger = multiprocessing.get_logger()
     # logger = logging.getLogger('process_video.'+input_ts_file)
@@ -1765,9 +1769,8 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
             framecount += int(15 * fps)
             continue
 
-        if geofence_spec and geofence.geofence_image(
-                geofence_spec, position.latitude, position.longitude,
-                shifted_time, False):
+        if geofence_spec and geofence_spec.position_in_fence(
+                position.latitude, position.longitude):
             logger.debug('skipping frame %d: fenced', framecount)
             # We can skip ahead a bit
             framecount += int(1 * fps)
