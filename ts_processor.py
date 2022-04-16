@@ -1531,6 +1531,7 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
     # logger = logging.getLogger('process_video.'+input_ts_file)
     logger.info('Processing %s', input_ts_file)
 
+    shiftdelta = timedelta(seconds=timeshift)
     vidcontext = (suppress_stdout_stderr if suppress_cv2_warnings else
                   contextlib.nullcontext)
     exifdata = {}
@@ -1599,6 +1600,14 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
     filename_based_start = guess_start_time(input_ts_file, tz=tz)
     first_time, last_time = ldmap.get(input_ts_file, (None, None))
 
+    if first_time > last_time:
+        logger.warning('GPS ends before it began? %s–%s',
+                       first_time, last_time)
+    
+    if (last_time-first_time).total_seconds() > length/fps:
+        logger.warning('Times exceed video length: %s–%s',
+                       first_time, last_time)
+
     if first_time and \
        abs(filename_based_start - first_time).total_seconds() > 600:
         # Embedded start time is way off
@@ -1659,17 +1668,22 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
 
     position_data = internal_gps_data
     if external_gps_data:
+        end_time = start_time + timedelta(seconds=float((length-1)/fps))
+        shift_start, shift_end = start_time+shiftdelta, end_time+shiftdelta
+        logger.debug('shifted video times: %s–%s', shift_start, shift_end)
         for track in external_gps_data.tracks:
-            ext_start, ext_end = external_gps_data.get_time_bounds()
-            if ext_start <= first_time and ext_end >= last_time:
+            ext_start, ext_end = track.get_time_bounds()
+            logger.debug(' %s times: %s–%s', track, ext_start, ext_end)
+            if ext_start <= shift_start and ext_end >= shift_end:
+                logger.debug('using external track %s', track)
                 position_data = track
+                break
 
         if position_data == internal_gps_data:
             ext_start, ext_end = external_gps_data.get_time_bounds()
             logger.warning('Ignoring external GPX data for track %s [%s–%s]: '
                            'out of time bounds [%s–%s].', input_ts_file,
-                           first_time, last_time,
-                           ext_start, ext_end)
+                           shift_start, shift_end, ext_start, ext_end)
 
     # ###Logging
     # if csv_out and not dry_run:
@@ -1724,7 +1738,6 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
     photos = []
     success = True
     browser = False
-    shiftdelta = timedelta(seconds=timeshift)
     last_position = None
 
     while success and framecount < length and (not limit or count < limit):
@@ -1822,6 +1835,7 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
                     framecount += 1
                     continue
                 elif turning_angle < min(anglediff, 360-anglediff):
+                    # Check for near 180 angles here?
                     logger.debug('turning')
                     useframe = True
                     turning = True
