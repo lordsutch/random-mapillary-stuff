@@ -1600,19 +1600,20 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
     filename_based_start = guess_start_time(input_ts_file, tz=tz)
     first_time, last_time = ldmap.get(input_ts_file, (None, None))
 
-    if first_time > last_time:
-        logger.warning('GPS ends before it began? %s–%s',
-                       first_time, last_time)
-    
-    if (last_time-first_time).total_seconds() > length/fps:
-        logger.warning('Times exceed video length: %s–%s',
-                       first_time, last_time)
+    if first_time and last_time:
+        if first_time > last_time:
+            logger.warning('GPS ends before it began? %s–%s',
+                           first_time, last_time)
 
-    if first_time and \
-       abs(filename_based_start - first_time).total_seconds() > 600:
-        # Embedded start time is way off
-        logger.warning('Filename says starts at %s, track starts at %s',
-                       filename_based_start, first_time)
+        if (last_time-first_time).total_seconds() > length/fps:
+            logger.warning('Times exceed video length: %s–%s',
+                           first_time, last_time)
+
+        if first_time and \
+           abs(filename_based_start - first_time).total_seconds() > 600:
+            # Embedded start time is way off
+            logger.warning('Filename says starts at %s, track starts at %s',
+                           filename_based_start, first_time)
 
     if not first_time and not last_time:
         start_time = first_time = filename_based_start
@@ -2146,7 +2147,7 @@ def main():
         geofence_spec = None
 
     if args.external_gpx:
-        logger.debug('Reading external GPX file %s', args.external_gpx)
+        logger.info('Reading external GPX file %s', args.external_gpx)
         gpx_opener = get_opener(args.external_gpx)
         with gpx_opener(args.external_gpx, 'rt') as gpxfile:
             external_gps_data = gpxpy.parse(gpxfile)
