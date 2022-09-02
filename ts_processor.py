@@ -173,7 +173,7 @@ def change_to_rational(number):
 
 
 EXIF_MAPPER = {
-    'max aperature': (piexif.ExifIFD.MaxApertureValue,
+    'max aperture': (piexif.ExifIFD.MaxApertureValue,
                       change_to_rational),
     'focal length': (piexif.ExifIFD.FocalLength, change_to_rational),
     '35mm equivalent focal length': (piexif.ExifIFD.FocalLengthIn35mmFilm, int),
@@ -1561,7 +1561,7 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
                   turning_angle: float=0, suppress_cv2_warnings=False,
                   use_sampling_interval=True, config=None, sensor_width=None,
                   bearing_modifier: float=0, use_speed=False, limit: int=0,
-                  max_aperature=None, rotate: float=0, output_format='jpeg',
+                  max_aperture=None, rotate: float=0, output_format='jpeg',
                   focal_length=None, min_coverage=90,
                   keep_aspect_ratio=False, gallery=False,
                   keep_night_photos=False,
@@ -1603,15 +1603,15 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
         config = configparser.ConfigParser()
 
     modstr = f'{make} {model}'
-    max_aperature = config.get(modstr, 'max_aperature',
-                               fallback=max_aperature)
-    if max_aperature:
+    max_aperture = config.get(modstr, 'max_aperture',
+                               fallback=max_aperture)
+    if max_aperture:
         # Convert to APEX - # of stops from f/1
-        apex_max_aperature = math.log(max_aperature**2, 2)
+        apex_max_aperture = math.log(max_aperture**2, 2)
         # F numbers are rounded to 2 SF, so reverse the rounding
         # and store precisely
-        apex_max_aperature = Fraction(round(apex_max_aperature)*6, 6)
-        exifdata['max aperature'] = apex_max_aperature
+        apex_max_aperture = Fraction(round(apex_max_aperture)*6, 6)
+        exifdata['max aperture'] = apex_max_aperture
 
     sensor_width = config.get(modstr, 'sensor_width',
                               fallback=sensor_width)
@@ -2107,8 +2107,8 @@ def main():
                         help='process in parallel; if PROCESSES omitted, use as many processes as there are CPU cores/threads')
     parser.add_argument('--use-speed', action='store_true',
                         help='include recorded speed in the output images')
-    parser.add_argument('--max-aperature', action='store', type=Decimal,
-                        help='camera maximum aperature (F number)')
+    parser.add_argument('--max-aperture', action='store', type=Decimal,
+                        help='camera maximum aperture (F number)')
     parser.add_argument('--sensor-width', action='store', type=Decimal,
                         help='camera sensor width (mm)')
     parser.add_argument('--focal-length', action='store', type=Decimal,
