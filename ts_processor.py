@@ -39,6 +39,7 @@ from typing import Optional, List, Callable, TextIO, Union, Iterable
 import av
 import av.filter
 # import cv2
+import gpmf
 import gpxpy
 # import imutils
 import piexif
@@ -440,6 +441,16 @@ def detect_file_type(input_file, device_override='', logger=logging):
         with open(input_file, "rb") as fx:
             with mmap.mmap(fx.fileno(), 0, access=mmap.ACCESS_READ) as mm:
                 mm.madvise(mmap.MADV_RANDOM)
+                container = av.open(mm, 'r')
+                if len(container.streams) >= 4:
+                    # GoPro would have >= 4 streams
+                    candidate = container.streams[3]
+                    if candidate.type == 'data':
+                        hname = candidate.metadata.get('handler_name', '')
+                        if 'GoPro MET' in hname:
+                            container.close()
+                            return 'P', 'GoPro', 'HERO', []
+                container.close()
                 eof = mm.size()
                 while mm.tell() < eof:
                     lazybox = struct.unpack('!I 4s',
@@ -515,7 +526,8 @@ def detect_file_type(input_file, device_override='', logger=logging):
     return device, make, model, detected_offsets
 
 
-def get_gps_data_nt(input_ts_file, device, tz, logger=logging, offsets=None):
+def get_gps_data_nt(input_ts_file, device, tz, logger=logging,
+                    offsets=None) -> gpxpy.gpx.GPXTrackSegment:
     packetno = 0
     locdata = {}
     with open(input_ts_file, "rb") as f:
@@ -550,11 +562,14 @@ def get_gps_data_nt(input_ts_file, device, tz, logger=logging, offsets=None):
                     locdata[packetno] = currentdata
                     packetno += 1
 
-    return locdata, packetno
+    return locdata_to_gpxsegment(locdata)
+
 
 garmin_gps_struct = struct.Struct('>s xx i i')
 
-def get_gps_data_garmin (input_ts_file, device, tz):
+
+def get_gps_data_garmin(input_ts_file, device,
+                        tz) -> gpxpy.gpx.GPXTrackSegment:
     packetno = 0
     locdata = {}
 
@@ -583,7 +598,7 @@ def get_gps_data_garmin (input_ts_file, device, tz):
                     fix='2d')
                 packetno += 1
 
-    return locdata, packetno
+    return locdata_to_gpxsegment(locdata)
 
 
 def parse_nmea_rmc(line: bytes, tzone='Z') -> dict:
@@ -608,7 +623,7 @@ def parse_nmea_rmc(line: bytes, tzone='Z') -> dict:
                 bearing=float(bits[8]), metric=0, prevdist=0)
 
 
-def get_gps_data_nmea(input_file, device, tz):
+def get_gps_data_nmea(input_file, device, tz) -> gpxpy.gpx.GPXTrackSegment:
     packetno = 0
     locdata = {}
 
@@ -650,10 +665,11 @@ def get_gps_data_nmea(input_file, device, tz):
                                         packetno += 1
                         offset += inp.end
 
-    return locdata, packetno
+    return locdata_to_gpxsegment(locdata)
 
 
-def get_gps_data_ts (input_ts_file, device, tz, logger=logging):
+def get_gps_data_ts(input_ts_file, device, tz,
+                    logger=logging) -> gpxpy.gpx.GPXTrackSegment:
     packetno = 0
     locdata = {}
     prevdata = {}
@@ -689,6 +705,33 @@ def get_gps_data_ts (input_ts_file, device, tz, logger=logging):
                     packetno += 1
 
     return locdata, packetno
+
+
+def get_gps_data_gopro(input_ts_file: os.PathLike, device: str,
+                       tzone) -> gpxpy.gpx.GPXTrackSegment:
+    container = av.open(str(input_ts_file), 'r')
+    try:
+        gpmf_stream = container.streams[3]
+    except IndexError:
+        container.close()
+        return gpxpy.gpx.GPXTrackSegment()
+
+    if 'GoPro MET' not in (hname :=
+                           gpmf_stream.metadata.get('handler_name', '')):
+        container.close()
+        return gpxpy.gpx.GPXTrackSegment()
+
+    # There should be raw GPMF data if we demux
+    content = b''
+    for packet in container.demux(streams=3):
+        content += bytes(packet)
+    container.close()
+
+    gps_blocks = gpmf.gps.extract_gps_blocks(content)
+    gps_data = [gpmf.gps.parse_gps_block(x) for x in gps_blocks]
+
+    # Parse to GPX format
+    return gpmf.gps.make_pgx_segment(gps_data)
 
 
 # Borked
@@ -915,7 +958,8 @@ def interpolate_locdata(start: dict, end: dict, proportions: dict = None,
 
 
 def extract_gps(input_ts_file: os.PathLike, tzone, logger,
-                make, model, device_override, length=0):
+                make, model, device_override,
+                length=0) -> gpxpy.gpx.GPXTrackSegment:
     '''Extract the GPS data from the specified input file.'''
     device, detected_make, detected_model, offsets = detect_file_type(
         input_ts_file, device_override, logger)
@@ -923,23 +967,25 @@ def extract_gps(input_ts_file: os.PathLike, tzone, logger,
     make = make or detected_make
     model = model or detected_model
 
+    if device == 'P':
+        segment = get_gps_data_gopro(input_ts_file, device, tzone)
     if device in "BVS":
-        locdata, packetno = get_gps_data_ts(input_ts_file, device, tzone, logger)
-    elif device in "T":
-        locdata, packetno = get_gps_data_nt(input_ts_file, device, tzone,
-                                            logger, offsets)
-    elif device in "N":
-        locdata, packetno = get_gps_data_nmea(input_ts_file, device, tzone)
-    elif device in "G":
-        locdata, packetno = get_gps_data_garmin(input_ts_file, device, tzone)
+        segment = get_gps_data_ts(input_ts_file, device, tzone, logger)
+    elif device == "T":
+        segment = get_gps_data_nt(input_ts_file, device, tzone,
+                                  logger, offsets)
+    elif device == "N":
+        segment = get_gps_data_nmea(input_ts_file, device, tzone)
+    elif device == "G":
+        segment = get_gps_data_garmin(input_ts_file, device, tzone)
     else:
-        return None, 0
+        segment = gpxpy.gpx.GPXTrackSegment()
 
-    logger.debug("GPS data analysis ended; %d points", len(locdata))
-    if length and packetno:
-        logger.debug("Frames per point: %f", length/packetno)
+    logger.debug("GPS data analysis ended; %d points", segment.get_points_no())
+    # if length and packetno:
+    #     logger.debug("Frames per point: %f", length/packetno)
 
-    return locdata, packetno
+    return segment
 
 
 MERGE_EPSILON = timedelta(seconds=1)
@@ -1200,9 +1246,9 @@ class AVVideoWrapper(VideoWrapper):
         # Set up image filter graph
         self.graph = av.filter.Graph()
         tail = self.graph.add_buffer(template=self.vidstream)
-        # range_filter = self.graph.add('setparams', 'range=pc')
-        # tail.link_to(range_filter)
-        # tail = range_filter
+        range_filter = self.graph.add('setrange', 'range=pc')
+        tail.link_to(range_filter)
+        tail = range_filter
         if rotate:
             angle = f'{-rotate}*PI/180'
             rotate_filter = self.graph.add(
@@ -1323,7 +1369,7 @@ def create_galleryview(video, frame, posinfo, basedir, prevframe,
     return fname
 
 
-def locdata_to_gpxsegment(filename, locdata) -> gpxpy.gpx.GPXTrackSegment:
+def locdata_to_gpxsegment(locdata) -> gpxpy.gpx.GPXTrackSegment:
     gpx_segment = gpxpy.gpx.GPXTrackSegment()
     for entry in locdata.values():
         # logger.debug('entry: %s', entry)
@@ -1355,11 +1401,9 @@ def fixup_gpx_order(gpx: gpxpy.gpx.GPX):
 def get_gps_data(input_ts_file: os.PathLike, tzone: timezone,
                  make, model, device_override) -> gpxpy.gpx.GPXTrackSegment:
     logger.debug('Getting GPS data from %s', input_ts_file)
-    locdata, packetno = extract_gps(input_ts_file, tzone, logger,
-                                    make, model, device_override)
-    if not locdata:
-        return None
-    return locdata_to_gpxsegment(input_ts_file, locdata)
+    segment = extract_gps(input_ts_file, tzone, logger,
+                          make, model, device_override)
+    return segment
 
 
 def get_all_gps(inputfiles: Iterable[os.PathLike], parallel: int, make: str,
