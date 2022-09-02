@@ -1428,7 +1428,7 @@ def get_all_gps(inputfiles: Iterable[os.PathLike], parallel: int, make: str,
     gpx_track = gpxpy.gpx.GPXTrack()
     gpx.tracks.append(gpx_track)
     for input_ts_file, gpx_segment in segments.items():
-        if gpx_segment:
+        if gpx_segment and gpx_segment.get_points_no():
             start_time = gpx_segment.points[0].time
             end_time = gpx_segment.points[-1].time
             # start_time, end_time = gpx_segment.get_time_bounds()
