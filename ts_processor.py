@@ -438,19 +438,19 @@ def detect_file_type(input_file, device_override='', logger=logging):
 
     if device == 'X' and extension == '.mp4' or not known:
         # Guess which MP4 method is used: Novatek, Subtitle, NMEA
+        container = av.open(str(input_file), 'r')
+        if len(container.streams) >= 4:
+            # GoPro would have >= 4 streams
+            candidate = container.streams[3]
+            if candidate.type == 'data':
+                hname = candidate.metadata.get('handler_name', '')
+                if 'GoPro MET' in hname:
+                    container.close()
+                    return 'P', 'GoPro', 'HERO', []
+        container.close()
         with open(input_file, "rb") as fx:
             with mmap.mmap(fx.fileno(), 0, access=mmap.ACCESS_READ) as mm:
                 mm.madvise(mmap.MADV_RANDOM)
-                container = av.open(mm, 'r')
-                if len(container.streams) >= 4:
-                    # GoPro would have >= 4 streams
-                    candidate = container.streams[3]
-                    if candidate.type == 'data':
-                        hname = candidate.metadata.get('handler_name', '')
-                        if 'GoPro MET' in hname:
-                            container.close()
-                            return 'P', 'GoPro', 'HERO', []
-                container.close()
                 eof = mm.size()
                 while mm.tell() < eof:
                     lazybox = struct.unpack('!I 4s',
@@ -547,7 +547,7 @@ def get_gps_data_nt(input_ts_file, device, tz, logger=logging,
                     locdata[packetno] = currentdata
                     packetno += 1
             if packetno > 0:
-                return locdata, packetno
+                return locdata_to_gpxsegment(locdata)
 
             # Slow scan
             logger.debug('no GPS data found fast way; attempting full scan')
