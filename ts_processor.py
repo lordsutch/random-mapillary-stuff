@@ -201,14 +201,16 @@ def build_exif_data(position: gpxpy.gpx.GPXTrackPoint, make: str, model: str,
     exiv_lng = tuple(change_to_rational(x) for x in lng_deg[:3])
     bearing = round((position.course + bearing_modifier) % 360, 2)
     nbear = change_to_rational(bearing)
-    dtstr = position.time.strftime(DATETIME_STR_FORMAT)
 
     utctime = position.time.astimezone(timezone.utc)
     utcdatestamp = utctime.strftime(DATE_STR_FORMAT)
+    fracsecs = utctime.second + Fraction(utctime.microsecond, 1_000_000)
     utctimestamp = (change_to_rational(utctime.hour),
                     change_to_rational(utctime.minute),
-                    change_to_rational(utctime.second +
-                                       utctime.microsecond / 1000000))
+                    change_to_rational(fracsecs))
+
+    dtstr = position.time.strftime(DATETIME_STR_FORMAT)
+    subsecstr = f'{(position.time.microsecond / 1000):03.0f}'
 
     if position.type_of_gpx_fix is None:
         measuremode = str(2+(position.elevation is not None))
@@ -257,6 +259,7 @@ def build_exif_data(position: gpxpy.gpx.GPXTrackPoint, make: str, model: str,
 
     exif_ifd = {
         piexif.ExifIFD.DateTimeOriginal: dtstr,
+        piexif.ExifIFD.SubSecTimeOriginal: subsecstr,
         piexif.ExifIFD.SceneType: b'\x01',       # Directly photographed
         piexif.ExifIFD.FileSource: b'\x03',      # Digital camera
         piexif.ExifIFD.SubjectDistanceRange: 3,  # Distant subject
