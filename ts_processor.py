@@ -932,7 +932,7 @@ def extract_gps(input_ts_file: os.PathLike, tzone, logger,
 
     if device == 'P':
         segment = get_gps_data_gopro(input_ts_file, device, tzone)
-    if device in "BVS":
+    elif device in "BVS":
         segment = get_gps_data_ts(input_ts_file, device, tzone, logger)
     elif device == "T":
         segment = get_gps_data_nt(input_ts_file, device, tzone,
