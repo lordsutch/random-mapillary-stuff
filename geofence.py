@@ -83,17 +83,19 @@ def parse_geofence_spec(spec: str, infile: Path) -> Geofence:
             lat2, lon2 = float(lexer.get_token()), float(lexer.get_token())
 
             fence.add_shape(shapely.geometry.Polygon(
-                ((lon1, lat1), (lon2, lat1), (lon2, lat2), (lon1, lat2))))
+                ((lon1, lat1), (lon2, lat1), (lon2, lat2), (lon1, lat2),
+                 (lon1, lat1))))
         elif token == 'poly':
             shape = []
             while (latstr := lexer.get_token()) != 'endpoly':
                 lat, lon = float(latstr), float(lexer.get_token())
-                shape.append((lat, lon))
+                shape.append((lon, lat))
             if len(shape) < 3:
                 print(f'Polygon should have >= 3 sides, got {len(shape)}.',
                       file=sys.stderr)
                 continue
             fence.add_shape(shapely.geometry.Polygon(shape))
+            # print(fence, file=sys.stderr)
         else:
             print(f'{lexer.error_leader()}Unknown token {token}',
                   file=sys.stderr)
