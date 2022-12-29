@@ -1246,9 +1246,12 @@ class AVVideoWrapper(VideoWrapper):
         self.wanted_time = 0
         self.mask = Image.open(maskfile) if maskfile else None
 
-        self.frameiter = self.container.decode(video=0)
-        frame = next(self.frameiter)
-        self.width, self.height = frame.width, frame.height
+        stream = self.container.streams.video[0]
+        self.width, self.height = stream.width, stream.height
+
+        # self.frameiter = self.container.decode(video=0)
+        # frame = next(self.frameiter)
+        # self.width, self.height = frame.width, frame.height
 
         # Set up image filter graph
         self.graph = av.filter.Graph()
@@ -1296,7 +1299,7 @@ class AVVideoWrapper(VideoWrapper):
     def __iter__(self):
         # May need to move forward from keyframe to get the right frame
         frame: av.VideoFrame
-        for frame in self.frameiter:
+        for frame in self.container.decode(video=0):
             # print('At', frame.time)
             if frame.time >= self.wanted_time:
                 # frame = frame.reformat(format='yuv420p')
@@ -1324,17 +1327,22 @@ class AVVideoWrapper(VideoWrapper):
 
 FNPARSER = re.compile('(\d{4})_?(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})')
 
+
 def guess_start_time(path: os.PathLike, first_fix_time: datetime=None,
                      tz: float = 0) -> datetime:
     path = Path(path)
+    tzinfo = timezone(timedelta(hours=tz))
     if match := FNPARSER.match(path.stem):
         year, month, day, h, m, s = (int(x) for x in match.groups())
-        ts = datetime(year, month, day, h, m, s,
-                      tzinfo=timezone(timedelta(hours=tz)))
+        ts = datetime(year, month, day, h, m, s, tzinfo)
         if first_fix_time and first_fix_time != ts:
             logger.info('guessed %s log starts at %s', ts, first_fix_time)
         return ts
-    return first_fix_time
+    stinfo = path.stat()
+    ts = datetime.fromtimestamp(stinfo.st_ctime, tzinfo)
+    if first_fix_time and first_fix_time != ts:
+        logger.info('guessed %s log starts at %s', ts, first_fix_time)
+    return ts
 
 
 def galleryview_path(frame):
@@ -1577,8 +1585,8 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
                   gpx_out=False, dry_run=False,
                   external_gps_data: gpxpy.gpx.GPX = None,
                   internal_gps_data: gpxpy.gpx.GPX = None,
-                  ldmap=None) -> int:
-    logger = multiprocessing.get_logger()
+                  logger=logger, ldmap=None) -> int:
+    # logger = multiprocessing.get_logger()
     # logger = logging.getLogger('process_video.'+input_ts_file)
     logger.info('Processing %s', input_ts_file)
 
@@ -2229,7 +2237,7 @@ def main():
 
     kwargs = {'config': config, 'geofence_spec': geofence_spec,
               'use_sampling_interval': use_sampling_interval,
-              'make': make, 'model': model,
+              'make': make, 'model': model, 'logger': logger,
               'external_gps_data': external_gps_data,
               'internal_gps_data': internal_gps_data, 'ldmap': ldmap,
               }
@@ -2246,12 +2254,12 @@ def main():
     frames_saved = {}
     if args.parallel == 1:
         cgitb.enable(format='text')
-        for filename in inputfiles:
-            frames_saved[filename] = process_video(filename, **kwargs)
+        frames_saved = {filename: process_video(filename, **kwargs)
+                        for filename in inputfiles}
 
         missing = [fname for fname, count in frames_saved.items() if not count]
         if missing:
-            logger.warning('Files with no frames saved:\n'+
+            logger.warning('Files with no frames saved:\n' +
                            os.linesep.join(str(x) for x in missing))
         return
 
@@ -2266,7 +2274,7 @@ def main():
         missing = sorted(fname for fname, count in frames_saved.items()
                          if not count)
         if missing:
-            logger.warning('Files with no frames saved:\n'+
+            logger.warning('Files with no frames saved:\n' +
                            os.linesep.join(str(x) for x in missing))
 
 
