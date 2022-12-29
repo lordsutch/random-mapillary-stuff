@@ -1220,7 +1220,7 @@ def guess_start_time(path: os.PathLike, first_fix_time: datetime=None,
     tzinfo = timezone(timedelta(hours=tz))
     if match := FNPARSER.match(path.stem):
         year, month, day, h, m, s = (int(x) for x in match.groups())
-        ts = datetime(year, month, day, h, m, s, tzinfo)
+        ts = datetime(year, month, day, h, m, s, 0, tzinfo)
         if first_fix_time and first_fix_time != ts:
             logger.info('guessed %s log starts at %s', ts, first_fix_time)
         return ts
