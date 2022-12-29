@@ -1127,6 +1127,7 @@ class AVVideoWrapper(VideoWrapper):
         self.fps = self.vidstream.average_rate  # 1 / self.vidstream.time_base
         self.length = self.vidstream.frames
         self.wanted_time = 0
+        self.current_time = 0
         self.mask = Image.open(maskfile) if maskfile else None
 
         stream = self.container.streams.video[0]
@@ -1183,6 +1184,7 @@ class AVVideoWrapper(VideoWrapper):
         # May need to move forward from keyframe to get the right frame
         frame: av.VideoFrame
         for frame in self.container.decode(video=0):
+            self.current_time = frame.time
             # print('At', frame.time)
             if frame.time >= self.wanted_time:
                 # frame = frame.reformat(format='yuv420p')
@@ -1197,8 +1199,11 @@ class AVVideoWrapper(VideoWrapper):
 
     def seek_frame(self, frameno):
         self.wanted_time = float(frameno / self.fps)
-        seekpoint = int(self.wanted_time / self.vidstream.time_base)
-        self.container.seek(seekpoint, stream=self.vidstream)
+        # Probably don't want to seek if wanted frame is in near future
+        if self.wanted_time <= self.current_time or (
+                self.wanted_time > self.current_time + 2):
+            seekpoint = int(self.wanted_time / self.vidstream.time_base)
+            self.container.seek(seekpoint, stream=self.vidstream)
 
     def close(self):
         if self.container:
