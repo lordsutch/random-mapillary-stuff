@@ -705,7 +705,13 @@ def get_gps_data_gopro(input_ts_file: os.PathLike, device: str,
     gps_data = [gpmf.gps.parse_gps_block(x) for x in gps_blocks]
 
     # Parse to GPX format
-    return gpmf.gps.make_pgx_segment(gps_data)
+    segment = gpmf.gps.make_pgx_segment(gps_data)
+
+    # Convert times to tzone
+    for point in segment.points:
+        point.time = point.time.replace(tzinfo=tzone)
+
+    return segment
 
 
 # Borked
@@ -881,43 +887,6 @@ def interpolate_track(locdata: dict, res: float = 1.0, num: int = 0, deg: int = 
                           speed=speeds[i], bearing=bearing, prevdist=distance,
                           metric=totaldist)
     return outdata
-
-
-def interpolate_locdata(start: dict, end: dict, proportions: dict = None,
-                        position: float = None) -> dict:
-    deltamx = end["mx"]-start["mx"]
-    deltamy = end["my"]-start["my"]
-    deltats = end["ts"]-start["ts"]
-    deltadist = end['metric']-start['metric']
-    deltabearing = (end['bearing']-start['bearing']) % 360
-    if deltabearing > 180:
-        deltabearing -= 360
-
-    deltaspeed = end['speed']-start['speed']
-
-    if position is not None:
-        proportions = {0 : position}
-
-    locdata = {}
-    for i, curpos in proportions.items():
-        mx = start["mx"] + deltamx*curpos
-        my = start["my"] + deltamy*curpos
-        lon, lat = metric_lonlat(mx, my)
-        dist = deltadist*curpos
-        prevdist = start['prevdist'] + dist
-        metric = start['metric'] + dist
-        bearing = (start['bearing'] + curpos*deltabearing) % 360
-
-        ts = start["ts"] + deltats*curpos
-        locdata[i] = dict(
-            ts=ts, posix_clock=ts.timestamp(),
-            mx=mx, my=my, lat=lat, lon=lon, active=b'I',
-            speed=max(start["speed"] + deltaspeed*curpos, 0),
-            bearing=bearing, metric=metric, prevdist=prevdist)
-
-    if position is not None:
-        return locdata[0]
-    return locdata
 
 
 def extract_gps(input_ts_file: os.PathLike, tzone, logger,
@@ -1657,7 +1626,7 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
 
         position = interpolate_location(position_data, shifted_time)
         if not position:
-            # logger.debug('no fix for frame %d at %s', framecount, shifted_time)
+            logger.debug('no fix for frame %d at %s', framecount, shifted_time)
             framecount += int(1 * fps)
             continue
 
