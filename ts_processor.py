@@ -438,8 +438,11 @@ def detect_file_type(input_file, device_override='', logger=logging):
 
     if device == 'X' and extension == '.mp4' or not known:
         # Guess which MP4 method is used: Novatek, Subtitle, NMEA
-        container = av.open(str(input_file), 'r')
-        if len(container.streams) >= 4:
+        try:
+            container = av.open(str(input_file), 'r')
+        except av.error.InvalidDataError:
+            container = None
+        if container and len(container.streams) >= 4:
             # GoPro would have >= 4 streams
             candidate = container.streams[3]
             if candidate.type == 'data':
@@ -447,7 +450,8 @@ def detect_file_type(input_file, device_override='', logger=logging):
                 if 'GoPro MET' in hname:
                     container.close()
                     return 'P', 'GoPro', 'HERO', []
-        container.close()
+        if container:
+            container.close()
         with open(input_file, "rb") as fx:
             with mmap.mmap(fx.fileno(), 0, access=mmap.ACCESS_READ) as mm:
                 mm.madvise(mmap.MADV_RANDOM)
@@ -1589,6 +1593,9 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
             video_iterator = iter(video)
         except av.error.InvalidDataError as exc:
             logger.warning('%s is invalid: %s', input_ts_file, exc)
+            return 0
+        except av.FFMpegError as exc:
+            logger.warning('%s error: %s', input_ts_file, exc)
             return 0
 
     fps, length = video.fps, video.length
