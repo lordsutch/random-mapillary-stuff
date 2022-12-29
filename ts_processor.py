@@ -2,14 +2,11 @@
 #Usage: python ts_processor.py --input 20210311080720_000421.TS  --sampling_interval 0.5 --folder output
 
 import argparse
-# import base64
-import bisect
 import bz2
 import cgitb
 import concurrent.futures
 import configparser
 import contextlib
-import csv
 import glob
 import gzip
 import inspect
@@ -19,7 +16,6 @@ import logging
 import math
 import mmap
 import multiprocessing
-import operator
 import os
 import re
 import struct
@@ -38,10 +34,8 @@ from typing import Optional, List, Callable, TextIO, Union, Iterable
 
 import av
 import av.filter
-# import cv2
 import gpmf
 import gpxpy
-# import imutils
 import piexif
 import pyproj
 from PIL import Image
@@ -128,11 +122,7 @@ def to_deg(value: float, loc: Iterable):  #From here: https://gist.github.com/c0
     minutes, seconds = divmod(minutes*60, 1)
 
     return (int(degrees), int(minutes), seconds*60, loc_value)
-    # deg =  int(abs_value)
-    # t1 = (abs_value-deg)*60
-    # minutes = int(t1)
-    # sec = round((t1 - minutes)* 60, 5)
-    # return (deg, minutes, sec, loc_value)
+
 
 # Stolen from https://stackoverflow.com/questions/16702966/rotate-image-and-crop-out-black-borders
 def rotatedRectWithMaxArea(w, h, angle):
@@ -174,16 +164,20 @@ def change_to_rational(number):
 
 EXIF_MAPPER = {
     'max aperture': (piexif.ExifIFD.MaxApertureValue,
-                      change_to_rational),
+                     change_to_rational),
     'focal length': (piexif.ExifIFD.FocalLength, change_to_rational),
-    '35mm equivalent focal length': (piexif.ExifIFD.FocalLengthIn35mmFilm, int),
-    'focal plane x resolution': (piexif.ExifIFD.FocalPlaneXResolution, change_to_rational),
-    'focal plane y resolution': (piexif.ExifIFD.FocalPlaneYResolution, change_to_rational),
+    '35mm equivalent focal length': (piexif.ExifIFD.FocalLengthIn35mmFilm,
+                                     int),
+    'focal plane x resolution': (piexif.ExifIFD.FocalPlaneXResolution,
+                                 change_to_rational),
+    'focal plane y resolution': (piexif.ExifIFD.FocalPlaneYResolution,
+                                 change_to_rational),
 }
 
 # A129 Pro
 # 7.2mm diagonal - crop factor of ~6 - 6.28 x 3.53mm
 # Pixel size 1.62 µm x 1.62 µm
+
 
 def build_exif_data(position: gpxpy.gpx.GPXTrackPoint, make: str, model: str,
                     width: int = None,
@@ -321,22 +315,10 @@ def to_gps_latlon(v, refs):
 def lonlat_metric(xlon, xlat):
     return Mercator(xlon, xlat)
 
-    # mx = xlon * (2 * math.pi * 6378137 / 2.0) / 180.0
-    # my = math.log( math.tan((90 + xlat) * math.pi / 360.0 )) / (math.pi / 180.0)
-
-    # my = my * (2 * math.pi * 6378137 / 2.0) / 180.0
-    # return mx, my
-
 
 # @cache
 def metric_lonlat(xmx, ymy):
     return Mercator(xmx, ymy, inverse=True)
-
-    # xlon = xmx / (2 * math.pi * 6378137 / 2.0) * 180.0
-    # xlat = ymy / (2 * math.pi * 6378137 / 2.0) * 180.0
-
-    # xlat = 180 / math.pi * (2 * math.atan( math.exp( lat * math.pi / 180.0)) - math.pi / 2.0)
-    # return xlon, xlat
 
 
 def decode_novatek_gps_packet(packet: bytes, tz: tzinfo=timezone.utc,
@@ -371,8 +353,6 @@ def decode_novatek_gps_packet(packet: bytes, tz: tzinfo=timezone.utc,
         speed_knots < 0 or active not in b'AV'):
         # Packet is invalid
         logger.debug('Packet invalid: %s', unpacked)
-        # logger.debug(packet.hex(' '))
-        # logger.debug(unpacked)
         return None
 
     ts = datetime(year=2000+year, month=month, day=day, hour=hour,
@@ -385,11 +365,8 @@ def decode_novatek_gps_packet(packet: bytes, tz: tzinfo=timezone.utc,
         return None
 
     speed = speed_knots * KNOTS_TO_MPS
-    return dict(lat=lat, latR=lathem, lon=lon, lonR=lonhem,
-                bearing=bearing, speed=speed, # mx=mx, my=my,
-                active=active, fix='2d',
-                # metric=0, prevdist=0,
-                ts=ts)
+    return dict(lat=lat, latR=lathem, lon=lon, lonR=lonhem, ts=ts,
+                bearing=bearing, speed=speed, active=active, fix='2d')
 
 
 def detect_file_type(input_file, device_override='', logger=logging):
@@ -589,19 +566,16 @@ def get_gps_data_garmin(input_ts_file, device,
                 if lat and lon:
                     lat /= 11930464.711111112
                     lon /= 11930464.711111112
-                    # mx, my = lonlat_metric(lon, lat)
                 else:
                     lat = lon = None
-                    # mx = my = None
 
                 locdata[packetno] = dict(
                     speed=speed_kmh / 3.6,
                     bearing=0, ts=datetime.fromtimestamp(0, timezone.utc),
                     posix_clock=0, active=b'A',
-                    lat=lat, lon=lon, # mx=mx, my=my,
+                    lat=lat, lon=lon,
                     latR=b'N' if lat >= 0 else b'S',
                     lonR=b'E' if lon >= 0 else b'W',
-                    # prevdist=0, metric=0,
                     fix='2d')
                 packetno += 1
 
@@ -617,15 +591,9 @@ def parse_nmea_rmc(line: bytes, tzone='Z') -> dict:
     lat = fix_coordinates(lathem, rawlat) if rawlat else None
     lon = fix_coordinates(lonhem, rawlon) if rawlon else None
 
-    # if rawlat and rawlon:
-    #     mx, my = lonlat_metric(lon, lat)
-    # else:
-    #     mx = my = None
-
     return dict(ts=ts, posix_clock=ts.timestamp(),
                 active=bits[2], lat=lat, latR=lathem, lon=lon,
                 lonR=lonhem, fix='2d',
-                # mx=mx, my=my,
                 speed=float(bits[7])*KNOTS_TO_MPS,
                 bearing=float(bits[8]), metric=0, prevdist=0)
 
@@ -680,11 +648,10 @@ def get_gps_data_ts(input_ts_file, device, tz,
     packetno = 0
     locdata = {}
     prevdata = {}
-    # prevpacket = None
     with open(input_ts_file, "rb") as f:
         with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
             mm.madvise(mmap.MADV_SEQUENTIAL)
-            input_packet = mm.read(188) # First packet, try to autodetect
+            input_packet = mm.read(188)  # First packet, try to autodetect
 
             while True:
                 input_packet = mm.read(188)
@@ -785,12 +752,6 @@ def build_gpxtree(locdata: List[tuple], make: str, model: str,
         if photo := fix.get('photo'):
             comment = ET.SubElement(trkpt, 'name')
             comment.text = photo
-        # comment.text = f'track point {i}'
-
-        # if thumb := fix.get('thumbnail'):
-        #     encthumb = base64.b64encode(thumb).decode("us-ascii")
-        #     url = ET.SubElement(trkpt, 'url')
-        #     url.text = f'data:image/jpeg;base64,{encthumb}'
 
         speed = ET.SubElement(trkpt, 'speed')
         speed.text = f"{fix['speed']:.1f}"
@@ -942,15 +903,10 @@ def interpolate_locdata(start: dict, end: dict, proportions: dict = None,
         mx = start["mx"] + deltamx*curpos
         my = start["my"] + deltamy*curpos
         lon, lat = metric_lonlat(mx, my)
-        # dist = WGS84.line_length(lats=(lat, start['lat']),
-        #                          lons=(lon, start['lon']))
         dist = deltadist*curpos
         prevdist = start['prevdist'] + dist
         metric = start['metric'] + dist
         bearing = (start['bearing'] + curpos*deltabearing) % 360
-
-        # if abs(deltabearing) > 2:
-        #     print('here', curpos, deltabearing, curpos*deltabearing, bearing)
 
         ts = start["ts"] + deltats*curpos
         locdata[i] = dict(
@@ -1087,48 +1043,12 @@ def clean_gps_data(locdata, length, fps, min_coverage, timeshift=0):
         logger.info(
             "Not enough GPS data for interpolation; %d%% needed, %f%% found",
             min_coverage, 100*len(locdata)/length*fps)
-    # elif len(locdata) < length/fps:
-    #     logger.info("Interpolating missing points: want %.1f have %d",
-    #                 length/fps, len(locdata))
-
-    #     locdata_ts = {}
-    #     for gps_loc in locdata.values():
-    #         locdata_ts[gps_loc['posix_clock']] = gps_loc
-
-    #     startclock = min(locdata_ts)
-    #     for i in range(int(length/fps)):
-    #         clock = startclock + i
-    #         if clock not in locdata_ts:
-    #             # Find previous existing
-    #             prev_pos = i - 1
-    #             while prev_pos not in locdata and prev_pos > 0:
-    #                 prev_pos -= 1
-
-    #             next_pos = i + 1
-    #             # Find next existing
-    #             while next_pos not in locdata and next_pos < length/fps:
-    #                 next_pos += 1
-
-    #             if prev_pos in locdata and next_pos in locdata:
-    #                 gap = next_pos - prev_pos
-
-    #                 props = {counter: (counter - prev_pos)/gap
-    #                          for counter in range(i, next_pos)}
-
-    #                 newdata = interpolate_locdata(locdata[prev_pos],
-    #                                               locdata[next_pos], props)
-
-    #                 for posinfo in newdata.values():
-    #                     locdata_ts[posinfo['posix_clock']] = posinfo
-
-    #     locdata = {i: posinfo for i, posinfo in enumerate(
-    #         sorted(locdata_ts.values(),
-    #                key=operator.itemgetter('posix_clock')))}
 
     locdata = interpolate_track(locdata)
 
     if len(locdata) >= 2:
-        time_per_fix = (locdata[max(locdata)]['posix_clock'] - locdata[min(locdata)]['posix_clock'])/len(locdata)
+        time_per_fix = (locdata[max(locdata)]['posix_clock'] -
+                        locdata[min(locdata)]['posix_clock'])/len(locdata)
         extend = int(math.ceil(abs(timeshift)/time_per_fix))
 
         for i in range(min(locdata), min(locdata)-extend, -1):
@@ -1149,12 +1069,6 @@ def clean_gps_data(locdata, length, fps, min_coverage, timeshift=0):
         for i, cum_distance in enumerate(accumulate(distances)):
             locdata[keylist[i+1]]['metric'] = cum_distance
 
-    # for i in range(1, max(locdata):
-    #     distance = WGS84.line_length(
-    #         lats=(locdata[i]['lat'], locdata[i-1]['lat']),
-    #         lons=(locdata[i]['lon'], locdata[i-1]['lon']))
-    #     locdata[i]["prevdist"] = distance
-    #     locdata[i]["metric"] = locdata[i-1]["metric"] + distance
     return locdata
 
 
@@ -1316,8 +1230,6 @@ class AVVideoWrapper(VideoWrapper):
         self.wanted_time = float(frameno / self.fps)
         seekpoint = int(self.wanted_time / self.vidstream.time_base)
         self.container.seek(seekpoint, stream=self.vidstream)
-        # print('Want', self.wanted_time, seekpoint)
-        # Seek isn't exact, will go to most recent keyframe
 
     def close(self):
         if self.container:
@@ -1446,8 +1358,6 @@ def get_all_gps(inputfiles: Iterable[os.PathLike], parallel: int, make: str,
         if gpx_segment and gpx_segment.get_points_no():
             start_time = gpx_segment.points[0].time
             end_time = gpx_segment.points[-1].time
-            # start_time, end_time = gpx_segment.get_time_bounds()
-            # trackmap.append((start_time, end_time, gpx_segment))
             ldmap[input_ts_file] = (start_time, end_time)
             gpx_track.segments.append(gpx_segment)
 
@@ -1491,9 +1401,6 @@ def interpolate_location(gpxdata: Union[gpxpy.gpx.GPX, gpxpy.gpx.GPXTrack],
                 # logger.debug('setting prev_point %s for %s', point, timestamp)
                 prev_point = point
                 # print(prev_point)
-            # elif not prev_point:
-            #     # Don't have anything earlier to use...
-            #     return point
             elif prev_point and point.time >= timestamp:
                 # Linear interpolation - probably should account for speed change?
                 speed = point.speed_between(prev_point)
@@ -1688,19 +1595,6 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
             logger.debug('start from onboard GPS: %s  guessed video start: %s',
                          start_time, filename_based_start)
 
-    # gpslen = (last_time - first_time).total_seconds()
-
-    # first_time = locdata[min(locdata)]['ts']
-    # last_time = locdata[max(locdata)]['ts']
-    # gpscount = len(locdata)
-
-    # vidlen = length/fps
-
-    # if not math.isclose(gpslen, vidlen, rel_tol=5):
-    #     logger.warning('%s: Video is %.2f sec, GPS track is %.2f sec',
-    #                    input_ts_file, vidlen, gpslen)
-    #     return 0
-
     ### Logging
 
     if not os.path.exists(folder) and not dry_run:
@@ -1713,21 +1607,6 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
         gallerydir = Path(folder) / ('gal-'+(Path(input_ts_file).stem))
         if not os.path.exists(gallerydir):
             os.makedirs(gallerydir)
-
-    # if csv_out and not dry_run:
-    #     with open(f'{fnbase}pre_interp.csv', 'w', newline='') as fd:
-    #         csvfile = csv.DictWriter(fd, fieldnames=locdata[min(locdata)],
-    #                                  delimiter=';')
-    #         csvfile.writeheader()
-    #         csvfile.writerows(locdata.values())
-
-    # if gpx_out and not dry_run:
-    #     internal_gps_data.name = f'GPS data extracted from {make} {model}'
-    #     gpxtree = internal_gps_data.to_xml(version="1.0")
-    #     # build_gpxtree(locdata, make, model)
-    #     with open(f'{fnbase}pre_interp.gpx', 'w') as fob:
-    #         fob.write(gpxtree)
-    ###
 
     position_data = internal_gps_data
     if external_gps_data:
@@ -1748,22 +1627,6 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
                            'out of time bounds [%s–%s].', input_ts_file,
                            shift_start, shift_end, ext_start, ext_end)
 
-    # ###Logging
-    # if csv_out and not dry_run:
-    #     with open(f'{fnbase}post_interp.csv', 'w', newline='') as fd:
-    #         csvfile = csv.DictWriter(fd, fieldnames=locdata[min(locdata)],
-    #                                  delimiter=';')
-    #         csvfile.writeheader()
-    #         csvfile.writerows(locdata.values())
-
-    # if gpx_out and not dry_run:
-    #     gpxtree = internal_gps_data.to_xml(version="1.0")
-    #     with open(f'{fnbase}post_interp.gpx', 'w') as fob:
-    #         fob.write(gpxtree)
-    #     # gpxtree = build_gpxtree(locdata, make, model)
-
-    ###
-
     if position_data.get_points_no() < min_points:
         logger.warning("Not enough GPS data for frame extraction: %s",
                        input_ts_file)
@@ -1776,26 +1639,10 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
 
     framecount = 0
     count = 0
-
     turning = False
-
-    # current_time = locdata[0]['ts']
-    # framelength = 1/fps
-    # locdata_ts = {}
-    # for gps_loc in locdata.values():
-    #     locdata_ts[gps_loc['posix_clock']] = gps_loc
-    # timestamps = sorted(locdata_ts)
-
-    # timestamps = sorted(x['ts'] for x in locdata)
-    # lastframe = {}
-    # next_distance = 0
     useframe = False
     raw_thumbnail = None
 
-    # This doesn't seem to be very accurate
-    # start_dt = guess_start_time(input_ts_file, locdata[min(locdata)]['ts'], tz)
-    # start_dt = locdata[min(locdata)]['ts']
-    # logger.debug('f: %s l: %s', first_time, last_time)
     logger.debug('%s: guessed first frame at %s', input_ts_file, start_time)
 
     photos = []
@@ -1808,30 +1655,7 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
         current_time = start_time + timedelta(seconds=float(framecount/fps))
         shifted_time = current_time + shiftdelta
 
-        # if True: #  framecount % fps == 0:
-        #     logger.debug('fr %d ts %s', framecount, shifted_time)
-        # prevts = [ts for ts in timestamps if ts <= shifted_time]
-        # if not prevts:
-        #     framecount += 1
-        #     continue
-
-        # nextts = [ts for ts in timestamps if ts > shifted_time]
-        # if not nextts:
-        #     break
-
-        # prev_fix = max(prevts)
-        # next_fix = min(nextts)
-        # locprev = locdata_ts[prev_fix]
-        # locnext = locdata_ts[next_fix]
-        # currentpos = (shifted_time-prev_fix)/(next_fix-prev_fix)
-        # posinfo = interpolate_locdata(locprev, locnext, position=currentpos)
-
         position = interpolate_location(position_data, shifted_time)
-
-        # if external_gps_data:
-        #     pos2 = interpolate_location(internal_gps_data, shifted_time)
-        #     logger.debug('onboard: %s  external: %s', pos2, position)
-
         if not position:
             # logger.debug('no fix for frame %d at %s', framecount, shifted_time)
             framecount += int(1 * fps)
@@ -1947,9 +1771,6 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
                 pil_image.save(jpgname, output_format, **PIL_SAVE_SETTINGS,
                                exif=exif_bytes)
 
-            # posinfo['photo'] = jpgname
-            # next_distance = posinfo['metric'] + metric_distance
-            # lastframe = posinfo
             count += 1
             photos.append((position, jpgname))
             last_position = position
@@ -1970,15 +1791,6 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
         return True
 
     logger.info('%s processed; %d image(s) extracted', input_ts_file, count)
-
-    # if gpx_out and not dry_run:
-    #     gpxtree = build_gpxtree(photos, make, model, generate_track=False)
-    #     gpxtree.write(f'{fnbase}photos.gpx')
-
-    # if kml_out and not dry_run:
-    #     kmltree = build_kml(photos, make, model)
-    #     kmltree.write(f'{fnbase}photos.kml')
-
     return count
 
 
