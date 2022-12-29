@@ -16,6 +16,7 @@ import exif
 import pyproj
 import shapely.geometry
 import shapely.ops
+import shapely.predicates
 from progress.bar import Bar
 
 WGS84 = pyproj.CRS('epsg:4326')
@@ -97,7 +98,13 @@ def parse_geofence_spec(spec: str, infile: Path) -> Geofence:
                 print(f'Polygon should have >= 3 sides, got {len(shape)}.',
                       file=sys.stderr)
                 continue
-            fence.add_shape(shapely.geometry.Polygon(shape))
+            geom = shapely.geometry.Polygon(shape)
+            if shapely.predicates.is_valid(geom):
+                fence.add_shape(geom)
+            else:
+                print('Polygon invalid:',
+                      shapely.predicates.is_valid_reason(geom),
+                      file=sys.stderr)
             # print(fence, file=sys.stderr)
         else:
             print(f'{lexer.error_leader()}Unknown token {token}',
