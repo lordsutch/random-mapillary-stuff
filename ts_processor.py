@@ -1133,16 +1133,12 @@ class AVVideoWrapper(VideoWrapper):
         stream = self.container.streams.video[0]
         self.width, self.height = stream.width, stream.height
 
-        # self.frameiter = self.container.decode(video=0)
-        # frame = next(self.frameiter)
-        # self.width, self.height = frame.width, frame.height
-
         # Set up image filter graph
         self.graph = av.filter.Graph()
         tail = self.graph.add_buffer(template=self.vidstream)
-        range_filter = self.graph.add('setrange', 'range=pc')
-        tail.link_to(range_filter)
-        tail = range_filter
+        # range_filter = self.graph.add('colorspace', 'bt601-6-525:range=pc')
+        # tail.link_to(range_filter)
+        # tail = range_filter
         if rotate:
             angle = f'{-rotate}*PI/180'
             rotate_filter = self.graph.add(
@@ -1184,9 +1180,10 @@ class AVVideoWrapper(VideoWrapper):
         # May need to move forward from keyframe to get the right frame
         frame: av.VideoFrame
         for frame in self.container.decode(video=0):
-            self.current_time = frame.time
-            # print('At', frame.time)
-            if frame.time >= self.wanted_time:
+            self.current_time = frame.pts * frame.time_base
+            # print('At', self.current_time, 'want', self.wanted_time)
+            if self.current_time >= self.wanted_time and (
+                    self.wanted_time < (self.current_time + frame.time_base)):
                 # frame = frame.reformat(format='yuv420p')
                 if self.mask:
                     img = frame.to_image()
@@ -1198,7 +1195,7 @@ class AVVideoWrapper(VideoWrapper):
                 yield filtered_frame.to_image()
 
     def seek_frame(self, frameno):
-        self.wanted_time = float(frameno / self.fps)
+        self.wanted_time = frameno / self.fps
         # Probably don't want to seek if wanted frame is in near future
         if self.wanted_time <= self.current_time or (
                 self.wanted_time > self.current_time + 2):
@@ -1486,7 +1483,7 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
         except av.error.InvalidDataError as exc:
             logger.warning('%s is invalid: %s', input_ts_file, exc)
             return 0
-        except av.FFMpegError as exc:
+        except av.error.FFmpegError as exc:
             logger.warning('%s error: %s', input_ts_file, exc)
             return 0
 
