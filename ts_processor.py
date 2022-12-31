@@ -1741,6 +1741,8 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
             if not dry_run:
                 pil_image.save(jpgname, output_format, **PIL_SAVE_SETTINGS,
                                exif=exif_bytes)
+                ftime = position.time.timestamp()
+                os.utime(jpgname, (ftime, ftime))
 
             count += 1
             photos.append((position, jpgname))
