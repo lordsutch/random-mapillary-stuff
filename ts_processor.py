@@ -1228,12 +1228,14 @@ def guess_start_time(path: os.PathLike, first_fix_time: datetime=None,
     return ts
 
 
-def galleryview_path(frame):
+def galleryview_path(frame: int):
     return f'frame{frame:06d}.html'
 
 
-def create_galleryview(video, frame, posinfo, basedir, prevframe,
-                       nextframe, lastframe):
+def create_galleryview(video: VideoWrapper, frame: int,
+                       posinfo: gpxpy.gpx.GPXTrackPoint,
+                       basedir: os.PathLike, prevframe: int,
+                       nextframe: int, lastframe: int):
     import folium
 
     video.seek_frame(frame)
@@ -1241,7 +1243,7 @@ def create_galleryview(video, frame, posinfo, basedir, prevframe,
     imgpath = f'img{frame:06d}.jpg'
     vidframe.save(Path(basedir) / imgpath)
 
-    coords = (posinfo['lat'], posinfo['lon'])
+    coords = (posinfo.latitude, posinfo.longitude)
     folium_map = folium.Map(location=coords, zoom_start=18)
     folium.Marker(coords, popup=f'frame {frame}').add_to(folium_map)
     map_html = folium_map._repr_html_()
