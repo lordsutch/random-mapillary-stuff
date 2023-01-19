@@ -1339,8 +1339,9 @@ def get_all_gps(inputfiles: Iterable[os.PathLike], parallel: int, make: str,
     return gpx, ldmap
 
 
-INTERPOLATE_EPSILON = timedelta(seconds=120)
+INTERPOLATE_EPSILON = timedelta(seconds=30)
 SCAN_EPSILON = timedelta(seconds=5)
+INSANE_SPEED = 100  # meters per second
 
 
 def interpolate_location(gpxdata: Union[gpxpy.gpx.GPX, gpxpy.gpx.GPXTrack],
@@ -1377,6 +1378,9 @@ def interpolate_location(gpxdata: Union[gpxpy.gpx.GPX, gpxpy.gpx.GPXTrack],
             elif prev_point and point.time >= timestamp:
                 # Linear interpolation - probably should account for speed change?
                 speed = point.speed_between(prev_point)
+                if speed >= INSANE_SPEED:
+                    return None
+
                 course = prev_point.course_between(point)
                 numerator = (timestamp - prev_point.time).total_seconds()
                 denominator = point.time_difference(prev_point)
@@ -1432,6 +1436,7 @@ def interpolate_location(gpxdata: Union[gpxpy.gpx.GPX, gpxpy.gpx.GPXTrack],
     # If we get here we need to extrapolate
     elapsed_time = (timestamp - prev_point.time).total_seconds()
     distance = prev_point.speed*elapsed_time
+
     newlon, newlat, backaz = WGS84.fwd(prev_point.longitude,
                                        prev_point.latitude, prev_point.course,
                                        distance)
