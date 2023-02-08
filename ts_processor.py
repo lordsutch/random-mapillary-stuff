@@ -1136,7 +1136,7 @@ class AVVideoWrapper(VideoWrapper):
         # Set up image filter graph
         self.graph = av.filter.Graph()
         tail = self.graph.add_buffer(template=self.vidstream)
-        # range_filter = self.graph.add('colorspace', 'bt601-6-525:range=pc')
+        # range_filter = self.graph.add('scale', 'in_range=mpeg')
         # tail.link_to(range_filter)
         # tail = range_filter
         if rotate:
