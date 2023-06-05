@@ -1,4 +1,7 @@
 # TO DO / Work in progress
 
 - Use gpxpy format throughout instead of dict to store GPS data.
+- Add command line option for FFmpeg hardware acceleration.
+- Use time rather than frames in main loop.
+- Motion interpolation?
 - Improve efficiency of code.
