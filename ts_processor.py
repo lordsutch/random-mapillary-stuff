@@ -7,6 +7,7 @@ import cgitb
 import concurrent.futures
 import configparser
 import contextlib
+import decimal
 import glob
 import gzip
 import inspect
@@ -1130,11 +1131,14 @@ class FFMPEGVideoWrapper(VideoWrapper):
     def __iter__(self):
         while (seektime := float(self.frame / self.fps)) < self.duration:
             # print('grabbing', self.frame, seektime)
+            seekval = Decimal.from_float(seektime).quantize(
+                Decimal('1.0000'), decimal.ROUND_DOWN)
+            
             proc = subprocess.run(
                 ('ffmpeg',
                  '-hwaccel', HWACCEL,  # Enable hardware acceleration
-                 '-ss', f'{seektime:.4f}',
-                 '-i', self.path,
+                 '-ss', str(seekval),
+                 '-i', str(self.path),
                  '-frames:v', '1', '-vf', self.filterspec,
                  '-f', 'rawvideo', '-pix_fmt', 'rgb24', 'pipe:1'),
                 capture_output=True)
@@ -1145,6 +1149,10 @@ class FFMPEGVideoWrapper(VideoWrapper):
                 self.fp.close()
             # self.fp = io.BytesIO(proc.stdout)
             # img = Image.open(self.fp)
+            if not proc.stdout:
+                print('No image data:', self.path, seekval, file=sys.stderr)
+                yield None
+            
             img = Image.frombytes('RGB', self.output_size, proc.stdout, 'raw')
 
             if self.mask:
@@ -1152,7 +1160,8 @@ class FFMPEGVideoWrapper(VideoWrapper):
 
             # print(img)
             yield img
-
+            # If we are iterating
+            self.frame += 1
 
 class OpenCVVideoWrapper(VideoWrapper):
     def __init__(self, path: os.PathLike, maskfile: os.PathLike = '',
