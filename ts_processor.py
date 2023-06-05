@@ -1142,10 +1142,9 @@ class FFMPEGVideoWrapper(VideoWrapper):
             if self.mask:
                 img = Image.composite(img, img, self.mask)
 
-            # print(img)
-            yield img
-            # If we are iterating
+            # Increment to the next frame before we yield
             self.frame += 1
+            yield img
 
 class OpenCVVideoWrapper(VideoWrapper):
     def __init__(self, path: os.PathLike, maskfile: os.PathLike = '',
