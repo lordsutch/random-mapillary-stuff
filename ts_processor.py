@@ -1081,7 +1081,6 @@ class FFMPEGVideoWrapper(VideoWrapper):
         self.height = video_stream['height']
         self.output_size = (self.width, self.height)
         self.frame = 0
-        self.fp = None
         
         filters = ['scale=in_range=tv:out_range=pc']
         # filters = []
@@ -1118,16 +1117,6 @@ class FFMPEGVideoWrapper(VideoWrapper):
     def seek_frame(self, frame):
         self.frame = frame  # Fake it until you make it
 
-    def __del__(self):
-        if self.fp:
-            self.fp.close()
-            self.fp = None
-
-    def close(self):
-        if self.fp:
-            self.fp.close()
-            self.fp = None
-
     def __iter__(self):
         while (seektime := float(self.frame / self.fps)) < self.duration:
             # print('grabbing', self.frame, seektime)
@@ -1144,11 +1133,6 @@ class FFMPEGVideoWrapper(VideoWrapper):
                 capture_output=True)
 
             # print(proc.stderr)
-            
-            if self.fp:
-                self.fp.close()
-            # self.fp = io.BytesIO(proc.stdout)
-            # img = Image.open(self.fp)
             if not proc.stdout:
                 print('No image data:', self.path, seekval, file=sys.stderr)
                 yield None
