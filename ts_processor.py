@@ -11,6 +11,7 @@ import glob
 import gzip
 import inspect
 import io
+import json
 import lzma
 import logging
 import math
@@ -19,6 +20,7 @@ import multiprocessing
 import os
 import re
 import struct
+import subprocess
 import sys
 import webbrowser
 from collections.abc import Mapping
@@ -34,6 +36,7 @@ from typing import Optional, List, Callable, TextIO, Union, Iterable
 
 import av
 import av.filter
+import ffmpeg
 import gpmf
 import gpxpy
 import piexif
@@ -64,10 +67,13 @@ DATE_STR_FORMAT = '%Y:%m:%d'
 THUMB_SIZE = 200
 THUMB_QUALITY = 'web_low'
 
+HWACCEL = 'none'
+# HWACCEL = 'auto'
+
 PIL_SAVE_SETTINGS = dict(quality=85,
                          # 4:2:0;  Source subsampling isn't better
                          subsampling=2,
-                         # optimize=True,
+                         optimize=True,
                          progressive=True)
 
 EXTENSIONS = {'jpeg': 'jpg'}
@@ -1050,6 +1056,104 @@ class VideoWrapper:
         self.close()
 
 
+class FFMPEGVideoWrapper(VideoWrapper):
+    def __init__(self, path: os.PathLike, maskfile: os.PathLike = '',
+                 rotate: float = 0, keep_aspect_ratio: bool = False,
+                 crop_top: int = 0, crop_left: int = 0,
+                 crop_bottom: int = 0, crop_right: int = 0):
+        crop = any((crop_top, crop_bottom, crop_left, crop_right))
+        self.mask = Image.open(maskfile) if maskfile else None
+        self.path = str(path)
+
+        cmdline = ('ffprobe', '-v', 'quiet', '-print_format', 'json',
+                   '-show_format', '-show_streams', self.path)
+        probe_output = subprocess.run(cmdline, capture_output=True, text=True)
+        probe = json.loads(probe_output.stdout)
+        
+        video_stream = next((stream for stream in probe['streams']
+                             if stream['codec_type'] == 'video'), None)
+
+        self.fps = Fraction(video_stream['avg_frame_rate'])
+        self.length = int(video_stream['nb_frames'])
+        self.duration = float(video_stream['duration'])
+        self.width = video_stream['width']
+        self.height = video_stream['height']
+        self.output_size = (self.width, self.height)
+        self.frame = 0
+        self.fp = None
+        
+        filters = ['scale=in_range=tv:out_range=pc']
+        # filters = []
+        if rotate:
+            angle = f'{-rotate}*PI/180'
+            filters.append(
+                f'rotate={angle}:ow=rotw({angle}):oh=roth({angle})')
+            
+            nw, nh = rotatedRectWithMaxArea(
+                self.width, self.height, math.radians(-rotate))
+            if keep_aspect_ratio:
+                orig_ratio = self.width / self.height
+                new_ratio = nw / nh
+                if new_ratio > orig_ratio:
+                    nw = nh*orig_ratio
+                else:
+                    nh = nw/orig_ratio
+
+            # ffmpeg's default is to center the crop, which is what we want
+            filters.append(f'crop=w={int(nw)}:h={int(nh)}')
+            self.output_size = (int(nw), int(nh))
+
+        if crop:
+            filters.append(
+                f'crop=x={crop_left}:y={crop_top}:'
+                f'w=in_w-{crop_left+crop_right}:'
+                f'h=in_h-{crop_top+crop_bottom}')
+            self.output_size = (self.output_size[0] - crop_left - crop_right,
+                                self.output_size[1] - crop_top - crop_bottom)
+
+        self.filterspec = ','.join(filters)
+        # print(self.filterspec, self.output_size)
+
+    def seek_frame(self, frame):
+        self.frame = frame  # Fake it until you make it
+
+    def __del__(self):
+        if self.fp:
+            self.fp.close()
+            self.fp = None
+
+    def close(self):
+        if self.fp:
+            self.fp.close()
+            self.fp = None
+
+    def __iter__(self):
+        while (seektime := float(self.frame / self.fps)) < self.duration:
+            # print('grabbing', self.frame, seektime)
+            proc = subprocess.run(
+                ('ffmpeg',
+                 '-hwaccel', HWACCEL,  # Enable hardware acceleration
+                 '-ss', f'{seektime:.4f}',
+                 '-i', self.path,
+                 '-frames:v', '1', '-vf', self.filterspec,
+                 '-f', 'rawvideo', '-pix_fmt', 'rgb24', 'pipe:1'),
+                capture_output=True)
+
+            # print(proc.stderr)
+            
+            if self.fp:
+                self.fp.close()
+            # self.fp = io.BytesIO(proc.stdout)
+            # img = Image.open(self.fp)
+            img = Image.frombytes('RGB', self.output_size, proc.stdout, 'raw')
+
+            if self.mask:
+                img = Image.composite(img, img, self.mask)
+
+            # print(img)
+            yield img
+
+
 class OpenCVVideoWrapper(VideoWrapper):
     def __init__(self, path: os.PathLike, maskfile: os.PathLike = '',
                  rotate: float = 0, keep_aspect_ratio: bool = False,
@@ -1065,6 +1169,7 @@ class OpenCVVideoWrapper(VideoWrapper):
         self.keep_aspect_ratio = keep_aspect_ratio
         self.crop_top, self.crop_bottom = crop_top, crop_bottom
         self.crop_left, self.crop_right = crop_left, crop_right
+        self.crop = any((crop_top, crop_bottom, crop_left, crop_right))
 
     def __del__(self):
         if self.video.isOpened():
@@ -1099,8 +1204,7 @@ class OpenCVVideoWrapper(VideoWrapper):
 
                 framedata = framedata[y1:y2, x1:x2]
 
-            if self.crop_left or self.crop_right or \
-                 self.crop_bottom or self.crop_top:
+            if self.crop:
                 h, w = framedata.shape[:2]
                 framedata = framedata[self.crop_top:h-self.crop_bottom,
                                       self.crop_left:w-self.crop_right]
@@ -1136,9 +1240,9 @@ class AVVideoWrapper(VideoWrapper):
         # Set up image filter graph
         self.graph = av.filter.Graph()
         tail = self.graph.add_buffer(template=self.vidstream)
-        # range_filter = self.graph.add('scale', 'in_range=mpeg')
-        # tail.link_to(range_filter)
-        # tail = range_filter
+        range_filter = self.graph.add('scale', 'in_range=tv:out_range=pc')
+        tail.link_to(range_filter)
+        tail = range_filter
         if rotate:
             angle = f'{-rotate}*PI/180'
             rotate_filter = self.graph.add(
@@ -1207,6 +1311,8 @@ class AVVideoWrapper(VideoWrapper):
             self.container.close()
             self.container = None
 
+
+VIDEOWRAPPER = FFMPEGVideoWrapper
 
 FNPARSER = re.compile('(\d{4})_?(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})')
 
@@ -1482,10 +1588,10 @@ def process_video(input_ts_file: str, folder: str, thumbnails: bool=False,
 
     with vidcontext():
         try:
-            video = AVVideoWrapper(input_ts_file, maskfile, rotate,
-                                   keep_aspect_ratio,
-                                   crop_top, crop_left,
-                                   crop_bottom, crop_right)
+            video = VIDEOWRAPPER(input_ts_file, maskfile, rotate,
+                                 keep_aspect_ratio,
+                                 crop_top, crop_left,
+                                 crop_bottom, crop_right)
             video_iterator = iter(video)
         except av.error.InvalidDataError as exc:
             logger.warning('%s is invalid: %s', input_ts_file, exc)
