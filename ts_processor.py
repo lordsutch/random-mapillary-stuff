@@ -1056,6 +1056,9 @@ class VideoWrapper:
     def __exit__(self, exc_type, exc_value, exc_traceback):
         self.close()
 
+    def close(self):
+        pass
+
 
 class FFMPEGVideoWrapper(VideoWrapper):
     def __init__(self, path: os.PathLike, maskfile: os.PathLike = '',
