@@ -6,4 +6,5 @@
 - Separate image selection and extraction loops
   (push selected image info to queue for extraction).
 - Motion interpolation?
+- Better position/velocity interpolation.
 - Improve efficiency of code.
